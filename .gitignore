@@ -1,0 +1,21 @@
+# Build output
+build/
+.xmake/
+vsxmake*/
+*.pdb
+*.ilk
+*.obj
+
+# Reverse-engineering dumps: extracted game shaders, meshes and capture exports (Bethesda content, ~5 GB)
+analysis/
+
+# Third-party binaries (NVIDIA Streamline / DLSS); get them from the official SDKs
+dlls/
+*.dll
+!dist/**/*.dll
+
+# Logs and local editor state
+*.log
+.vs/
+.vscode/
+.claude/settings.local.json
