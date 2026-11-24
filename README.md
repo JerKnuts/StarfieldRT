@@ -147,3 +147,14 @@ py -3 tools\make_options_esm.py
 ## Versioning
 
 `1.0.0` is launch. `0.B.0` marks big milestones, and every other update bumps the last number. See [AGENTS.md](AGENTS.md) and [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+Starfield RT is free software under the **GNU General Public License v3.0** (see [LICENSE](LICENSE)). It has to be: it compiles in [CommonLibSF](https://github.com/Starfield-Reverse-Engineering/CommonLibSF), which is GPL-3.0.
+
+Third-party code in this repository:
+
+- `external/commonlibsf`: CommonLibSF, GPL-3.0 ([COPYING](external/commonlibsf/COPYING)).
+- `external/streamline/include`: NVIDIA Streamline SDK headers, MIT ([license.txt](external/streamline/license.txt)).
+
+Not included: the NVIDIA Streamline/DLSS runtime DLLs (get them from NVIDIA's Streamline SDK) and any game files. Starfield is a trademark of Bethesda Softworks; this project isn't affiliated with Bethesda or NVIDIA.
