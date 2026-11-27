@@ -23,6 +23,9 @@ SamplerState                    AlphaSampler : register(s0, space1);
 // 0.1.30: soft shadows. Pass 1 (main) writes per-pixel results here; pass 2 (Denoise) filters them into Mask.
 // 8 bytes per pixel: +0 half2 (visibility, mean blocker distance; distance -1 = pixel not traced), +4 view distance.
 RWByteAddressBuffer             Vis         : register(u1, space1);
+// 0.5.134: phantom detector. [0, 64 KB): 1 bit per instance record, "the game doesn't draw it" (read by the TLAS build:
+// such objects get mask 0x10, traced by nothing but this detector). [64 KB, +4 B per record): phantom samples in a row.
+RWByteAddressBuffer             Phantom     : register(u2, space1);
 
 cbuffer PerScene : register(b0)
 {
@@ -54,6 +57,16 @@ cbuffer Params : register(b2)
 };
 
 #include "AlphaTest.hlsli"
+
+// 0.5.106: fade-in after a load (SoftFlags bits 20..27, 255 = done). Until it is done the game's sun cascades still draw,
+// so RT shadows are added on top of the game's (min with the contact mask, fading in); after it they replace them.
+float SunOut(float game, float rt)
+{
+    const float f = float((SoftFlags >> 20) & 255u) / 255.0f;
+    if (Mode == 1 || f < 1.0f)
+        return min(game, lerp(1.0f, rt, f));
+    return rt;
+}
 
 // 0.1.21: the contact-shadow light vector (Data row 5) is in CAMERA space (x right, y up, z forward)
 // and points toward the light. Rotate it to world space with the camera basis from the inverse
@@ -121,7 +134,7 @@ float InterleavedGradientNoise(float2 p)
 }
 
 // Traces one shadow ray toward `dir`; returns true if blocked, with the blocker distance in `hitT`.
-bool TraceSunOnce(RayDesc ray, out float hitT, out bool frontFace);
+bool TraceSunOnce(RayDesc ray, out float hitT, out bool frontFace, out bool giant);
 
 // 0.5.55: a back-face hit within selfGap of the start is passed through (up to twice), as reflections (0.5.33), GI
 // (0.5.46) and lamp shadows (0.5.45) do. Far buildings are drawn with a simpler level-of-detail mesh than our RT copy
@@ -134,19 +147,20 @@ bool TraceSun(float3 origin, float3 dir, float selfGap, out float hitT)
     ray.Direction = dir;
     ray.TMin = 0.0f;
     ray.TMax = MaxDistance;
-    bool front;
+    bool front, giant;
     [loop] for (uint tries = 0; tries < 3; ++tries)
     {
-        if (!TraceSunOnce(ray, hitT, front))
+        if (!TraceSunOnce(ray, hitT, front, giant))
             return false;
-        if (front || hitT >= selfGap || tries == 2)
+        // 0.5.132: a back face of a giant object (hit group 3: distant-detail blocks) never blocks, wherever it is.
+        if (front || (hitT >= selfGap && !giant) || tries == 2)
             return true;
         ray.TMin = hitT + 0.01f;
     }
     return true;
 }
 
-bool TraceSunOnce(RayDesc ray, out float hitT, out bool frontFace)
+bool TraceSunOnce(RayDesc ray, out float hitT, out bool frontFace, out bool giant)
 {
     // 0.1.23: opaque geometry commits automatically; alpha-tested instances (FORCE_NON_OPAQUE in the TLAS)
     // come back as candidates and are committed only where their opacity texture is solid.
@@ -177,7 +191,61 @@ bool TraceSunOnce(RayDesc ray, out float hitT, out bool frontFace)
     const bool hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     hitT = hit ? q.CommittedRayT() : 0.0f;
     frontFace = hit && q.CommittedTriangleFrontFace();
+    giant = hit && q.CommittedInstanceContributionToHitGroupIndex() == 3u;  // 0.5.132
     return hit;
+}
+
+// 0.5.134: on 1 trace pixel in 16 per frame (rotating), a camera ray toward the visible surface (solid + phantom masks,
+// alpha tested). A rigid object hit clearly in front of what the game shows there is drawn nowhere at that pixel: a
+// phantom sample. One hit where the game shows it is a visible sample, which clears the object's count and bit. 16
+// phantom samples in a row set the bit. Phantoms seen in probes: a settling 2-part object beside a Jemison bin (shadowed
+// the floor), a glass-flagged 4 m object over the MAST floor.
+void PhantomSample(uint2 q, float3 posRel, float viewDist)
+{
+    if (!(AlphaFlags & 256u) || viewDist > 120.0f || (((q.x & 3u) | ((q.y & 3u) << 2)) != (Frame & 15u)))
+        return;
+    RayDesc r;
+    r.Origin = PerSceneRows[0].xyz;
+    r.Direction = posRel / viewDist;
+    r.TMin = 0.05f;
+    r.TMax = viewDist * 1.05f + 0.5f;
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> dq;
+    dq.TraceRayInline(Scene, (AlphaFlags & 1u) ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPAQUE, 0x11u, r);
+    uint cands = 0;
+    while (dq.Proceed())
+    {
+        if (dq.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+            continue;
+        if (dq.CandidateInstanceContributionToHitGroupIndex() == 1u)
+            continue;
+        if (++cands > 64)
+        {
+            dq.Abort();
+            break;
+        }
+        if (AlphaPasses(dq.CandidateInstanceID(), dq.CandidatePrimitiveIndex(), dq.CandidateTriangleBarycentrics()))
+            dq.CommitNonOpaqueTriangleHit();
+    }
+    if (dq.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+        return;
+    const uint hg = dq.CommittedInstanceContributionToHitGroupIndex();
+    const uint inst = dq.CommittedInstanceID();
+    if (hg == 1u || hg == 2u || inst >= (1u << 19))
+        return;  // characters and the player: their copies lag the game's pose
+    const float t = dq.CommittedRayT();
+    const uint word = (inst >> 5) * 4u, bit = 1u << (inst & 31u), ca = 65536u + inst * 4u;
+    if (abs(t - viewDist) < max(0.15f, viewDist * 0.05f))
+    {
+        Phantom.Store(ca, 0u);
+        Phantom.InterlockedAnd(word, ~bit);
+    }
+    else if (t < viewDist * 0.9f - 0.25f)
+    {
+        uint prev;
+        Phantom.InterlockedAdd(ca, 1u, prev);
+        if (prev + 1u >= 16u)
+            Phantom.InterlockedOr(word, bit);
+    }
 }
 
 void StoreVis(uint2 p, uint width, float vis, float blocker, float viewDist)
@@ -247,6 +315,7 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
+    PhantomSample(q, posRel, viewDist);  // 0.5.134
     const float3 toSun = SunDirectionWorld();
     bool fromTlas;
     const float3 origin = ShadowRayOrigin(posRel, viewDist, toSun, fromTlas);
@@ -270,10 +339,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     {
         float t;
         const float visibility = TraceSun(origin, toSun, selfGap, t) ? 0.0f : 1.0f;
-        if (Mode == 1)
-            Mask[p] = min(Mask[p], visibility);
-        else
-            Mask[p] = visibility;
+        Mask[p] = SunOut(Mask[p], visibility);  // 0.5.106
         return;
     }
 
@@ -411,8 +477,5 @@ void Denoise(uint3 tid : SV_DispatchThreadID)
             result = sum / wsum;
         }
     }
-    if (Mode == 1)
-        Mask[p] = min(Mask[p], result);
-    else
-        Mask[p] = result;
+    Mask[p] = SunOut(Mask[p], result);  // 0.5.106
 }

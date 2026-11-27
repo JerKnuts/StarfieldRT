@@ -517,3 +517,63 @@ The plugin (0.2.58) catches table 4 in SetComputeRootDescriptorTable by its 40 K
 - **LOD record dword 2** (position handle, `Lods[id*80+8]`): **bit 30 set = the game GPU-skinned this instance this frame** (low bits then point at a per-frame skinned buffer, e.g. `c1bfc003`). Only drawn instances are skinned: the unused body has it clear (`1b1580d0`, `00000088`, ...). Some NPC head parts (eyes, hair: VS-skinned) never have it set even on screen.
 - **Root rotation:** characters' instance quaternions are yaw only `(0, 0, z, w)`. The first-person rig's is tilted, y about -0.17 (same in first and third person).
 - Instance record dwords 12-19 (+48) hold the previous frame's quaternion/translation/scale. Records are in a DEFAULT heap (not CPU-readable); the probe copies them on the GPU.
+
+## Level-of-detail rings: reflections hit their own surface from the front (0.5.76)
+
+- Symptom: RT reflections on a wall (Ryujin lobby) covered only a circle around the camera that grew as the player walked in.
+- Reflection-ray probe (`[R] reflection ray at the crosshair`, 0.5.74): wall 3.8 m away -> the ray hit the room behind at 14 m (fine); wall 12 m away -> the ray hit **the same wall instance at 0.01 m, front face**.
+- Past the game's LOD switch the drawn wall is a simpler mesh and our LOD0 copy can sit slightly in front of it, so a reflection ray leaving the drawn surface hits the copy's front face. 0.5.33 skipped only back-face self-hits.
+- Fix: within the self-gap (0.1 m + 2% of view distance), also skip front-face hits whose geometric normal is parallel to the surface normal (|dot| > 0.8).
+- Rule of thumb confirmed again: any RT effect that changes in a circle around the camera is this LOD mismatch first. Probe the actual ray hit before other theories, and in debug colour views check "self-hit" before "taken from the screen" (a self-hit lands on its own on-screen pixel).
+
+## Camera for passes after the OIT composite (0.5.84)
+
+- The thin-glass pass and the GI/reflection image capture run in the CompositeMomentBasedOIT hook. They used to take PerSceneConstants from the last recorded reflection pass (GatherIndirect), and that was from **another frame 596 of 600 times**. Passes are recorded on several threads, and the composite is usually recorded before that frame's GatherIndirect. With a frame-old camera and this frame's depth, glass reflections lagged and jumped while turning.
+- The transparency pass's tables hold no PerScene CBV (0.5.83 found none). The current camera is available from the **global scene table** bound for the composite draw (graphics root table 1, entry 34, a PerSceneConstants copy, 53,008-53,248 B CBV). It was found 600 of 600 frames.
+- Rule: any pass hooked late in the frame must take its camera from its own command list's bindings, never from data remembered from another pass.
+
+## Candidate caps cut rays short in dense see-through areas (0.5.97, 2026-11-25)
+
+Inline ray queries don't hand non-opaque candidates over nearest first. The glass camera ray aborted after 64 candidates. Looking through a Neon storefront pane (0.4 m away) toward the smoke and truss layers, it used up 64 far candidates before reaching the pane: 'no pane' magenta patches in the debug view that changed every frame. Raised to 512. The other loops (PROCEED_ALPHA_NOPLAYER: commit after 32, abort after 64; the lamp shadow loop: 64) have the same weakness. Suspect them first if reflections or shadows flicker in patches only where smoke or layered see-through geometry fills the view.
+
+## Tagged hit hid a nearer untagged pane (0.5.99, 2026-11-25)
+
+The glass camera ray first traces tagged glass (mask 0x02) and only ran the untagged-window search when that found nothing. At a Neon storefront the per-frame crosshair ring (0.5.98, Numpad .) showed reflected / reflected / rejected repeating every 3 frames. Every 3rd frame the tagged ray hit a tagged layer on the floor 18.4 m behind the untagged pane (instance 45655, family 0), which the standoff test rejects; the pane at 0.37 m was never searched for. Fix: the untagged search also runs in front of a tagged hit (TMax = that hit's distance). Why the far layer shows up in only 1 frame of 3 is still unknown (it may be in only one of the rotating TLAS builds). Use the crosshair ring first for any per-frame glass flicker.
+
+## RT scene size outdoors (0.5.100-0.5.102, 2026-11-25)
+
+- Units are metres. On the Neon walkways the TLAS holds about 222k objects: 160-175k at 50-200 m, 134k with a bounding radius of 2-10 m. About 3k are alpha-tested and 369 are effect meshes.
+- Jemison holds 135-170k objects, 83-98k of them more than 1 km away (Ultra's 4 km range), and 18k are alpha-tested.
+- Exact copies (same BLAS, same position to 1 cm, same rotation and scale) are only about 1.5% (3.5k on the walkways).
+- 62% of the walkway objects (139k) share their exact position, rotation and scale with a *different* mesh. These are the parts of one model split by material: each part is its own instance record. They are real geometry. Merging each set into one BLAS would cut the instance count to about 83k, but every combination would need its own BLAS.
+- The size-on-screen cut (radius / distance below 0.0015-0.004) removes 1.4% on the walkways and 18% in Jemison.
+- In short sessions the walkways and Jemison run at 25-31 ms (FG on), with VRAM at 50-60%. The soak test's 61 ms and 90-100 ms came after about 30 min with VRAM at 97%, so the big slowdown follows VRAM growth more than object count.
+
+## Other material families (0.5.111 scene-table dump, 2026-11-25)
+
+- Family 0 = standard (+11, 288 B), family 3 = vegetation (+13, 368 B). Glowing screens in Neon are family 7 (material 227, 366) and family 12 (material 72).
+- Dump of entry 72 for a family 12 screen (bright magenta in the image):
+  - **+22** (368 B, 1536 entries): `41fea5dd 0 7f7fffff 0 00003341 ...` = luminous 31.8, EV 0, max FLT_MAX, flags 0x3341: the standard emission block layout. Probably family 12's table (other 368-byte tables: +23 256 entries, +24 32 entries).
+  - +12 (96 B, 256 entries) holds 0x80f-0x896 and +17 (176 B, 6144 entries) holds 0x490-0x495: texture heap index candidates.
+  - Other CPU-readable slots: +14 (112 B), +15 (528 B), +18 (192 B), +21 (416 B), +39 (128 B) were zero at index 72; +40 (224 B) holds matrices.
+- A family 7 screen read almost black in last frame's image (HDR 0.016): its video likely lands after our capture. Needs a family 7 dump.
+- **Family 7 screens are material flipbooks (0.5.115 glass ring):** the instance's LOD dword 0 changes material every frame (instance 3398: 372, 408, 358, 434, 369, ...). The video is the sequence of family 7 materials, so per-object caches must not key on the material bits for family 7.
+- **...and each video frame is a separate instance record** (0.5.116 probes of one screen: instances 2977, 3111, 3072, 3146, materials 237/391/427/379, same mesh 9049, same place). Per-object caches for family 7 must key on position (or mesh + position), not the instance index.
+
+## Railing-glass "squares" are street-lamp reflections (2026-11-26, 0.5.125 probe split)
+- The thin-glass reflection rays at the squares hit the street lamps' white diffusers (family 0, material 144 / 662, albedo 1.0) off screen. Our shading of that hit: emission 0.7-0.95, the lamp inside it 4.1-5.4, ambient + sun 0.37 (HDR lum at exposure 0.21-0.23). Total about 5-6.6.
+- The game draws the same kind of lamp panel at HDR 18 at exposure 0.83 (radiance 21.6), which is about HDR 4.8 at exposure 0.22. So the reflected brightness is within about 25% of the real lamp: the squares are a genuine reflection, not a phantom.
+- Our emission alone underestimates these diffusers about 5x; the lamp lighting its own diffuser makes up the difference. Skipping lamp light on emissive surfaces would leave them far too dim.
+
+## Material flags 0x12 are not always glass (2026-11-26)
+- Jemison Mercantile wall panel (instance 42018, material 563, flags +108 = 0x12) is drawn as a solid G-buffer surface (type 0, roughness 0.31), yet 0x12 is also the window-pane value. The 0.2.44 rule put it in the glass mask, so reflection rays went through it. 0.5.126 uses the glass pass's per-object see-through score to give objects the game draws solid the solid mask too (bits in a permanent 64 KB UAV, `GlassSolidBits`).
+
+## Where the game's cubemaps are applied (2026-11-26, 0.5.129 cube survey)
+- GatherIndirect (the probe-specular pass RT reflections replace) binds a single 256 px cube at table 4 +7 and a 4x4 cube at +8, not the probe array.
+- The reflection-probe array (R11G11B10, 256 px, 198 slices = 33 cubes, 7 mips) and its R16 companion (192 slices, 1 mip) are bound by about 15 table sets per frame: unhooked graphics and compute passes, UnsortedForwardBlendedPreMBOIT, MomentBasedOITRenderMoments / Transparency / AdditiveTransparency. A second 198-slice array and a 12-slice array appear in GroupedDynamicShadowMap and compute passes (probe capture).
+- Survey caveat: scanning 32 entries past each table start reads into neighbouring tables, so group hits by heap slot (table heap index + entry).
+- 0.5.130 blanks the probe array at descriptor-copy time (every write or copy of its SRV into a shader-visible slot becomes a black cube array view) while RT reflections are on.
+
+## Distant-detail city blocks shadow the floor up close (2026-11-26, 0.5.130 probe)
+- Jemison station floor: every sun ray was blocked 0.1-0.4 m up by instance 32824, a 512 m solid mesh at round coordinates (-700, 1700, -239), never in the depth buffer (139 of 142 hits on back faces). Its instance dword 0 was 0xc07fffc0 (ordinary objects 0x007f00c0). Another 256 m never-drawn block (instance 135658, flags 0x12) sat at floor height.
+- The game doesn't draw these blocks near the camera; our copy is always in the TLAS. 0.5.132 tags objects over 150 m across as hit group 3 and lets sun rays pass their back faces at any distance. If shadows from them still show (front faces), the next step is leaving such blocks out of the TLAS while the camera is inside their bounds.

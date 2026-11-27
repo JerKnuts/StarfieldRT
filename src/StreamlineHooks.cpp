@@ -6,6 +6,7 @@
 #include <SFSE/SFSE.h>  // CommonLibSF must come before any Windows headers
 
 #include "StreamlineHooks.h"
+#include "Blas.h"  // 0.5.105: SceneSettling
 
 #include <Windows.h>
 #include <d3d12.h>
@@ -16,12 +17,14 @@
 #include <format>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <tuple>
 
 #include <sl.h>
 #include <sl_dlss.h>
 #include <sl_dlss_d.h>  // 0.5.0: Ray Reconstruction
+#include <sl_dlss_g.h>  // 0.5.90: Frame Generation state for the log
 
 #include <vector>
 
@@ -44,6 +47,11 @@ namespace rt
         PFn_slSetConstants        g_slSetConstants = nullptr;
         PFn_slGetFeatureFunction  g_slGetFeatureFunction = nullptr;
         PFn_slDLSSSetOptions      g_slDLSSSetOptions = nullptr;
+        // 0.5.90: the game's Frame Generation options, only so the log (and the PERF lines) say whether FG was on.
+        using PFn_slDLSSGSetOptions = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSGOptions&);
+        PFn_slDLSSGSetOptions     g_slDLSSGSetOptions = nullptr;
+        std::atomic<int>          g_fgMode{ -1 };
+        std::atomic<std::uint64_t> g_fgChangedTick{ 0 };  // 0.5.105: GetTickCount64 of the last Frame Generation on/off  // -1 never set, else sl::DLSSGMode (0 off, 1 on, 2 auto)
 
         // 0.5.0: DLSS Ray Reconstruction. Loaded next to DLSS-SR at slInit; while the game's DLSS options, our guide images
         // and the RR options are all in place, the game's DLSS-SR evaluate is run as DLSS-RR instead (fallback: SR).
@@ -54,9 +62,42 @@ namespace rt
         PFn_slDLSSDSetOptions     g_rrSetOptions = nullptr;
         PFn_slIsFeatureLoaded     g_slIsFeatureLoaded = nullptr;
         std::mutex                g_rrLock;
+        // 0.5.85: DLSS options per viewport. The game sets them per viewport: opening a menu sets viewport 2 to mode
+        // off with an output of 0xFFFFFFFF x 0xFFFFFFFF. Before, one global copy kept whichever call came last, so the
+        // main viewport's Ray Reconstruction was set up with the menu's invalid options: with Frame Generation on, the
+        // GPU hung right after opening a menu (FG test 2026-11-24: no hang without the plugin, with every effect off,
+        // or with RR paused).
+        struct ViewportDlss
+        {
+            sl::DLSSOptions o{};
+            bool have = false;
+            bool rrOk = false;  // RR options accepted for this viewport this session
+        };
+        // 0.5.86: keyed by viewport number. The game takes a NEW viewport number for the main view at every menu toggle
+        // (0, 2, 4 ... 100 in one session); 0.5.85's fixed table of 8 had no slot past 7, so RR silently stopped.
+        // A viewport set to DLSS off is dropped (the game doesn't use it again).
+        std::unordered_map<uint32_t, ViewportDlss> g_vp;  // under g_rrLock
+        ViewportDlss* FindViewport(uint32_t v)
+        {
+            const auto it = g_vp.find(v);
+            return it == g_vp.end() ? nullptr : &it->second;
+        }
         sl::DLSSOptions           g_lastDlss{};
         bool                      g_haveDlss = false;
-        bool                      g_rrOptionsOk = false;
+        bool                      g_rrOptionsOk = false;  // any viewport (log only)
+        bool DlssOptionsValid(const sl::DLSSOptions& o)
+        {
+            return o.mode != sl::DLSSMode::eOff && o.outputWidth > 0 && o.outputWidth <= 16384 && o.outputHeight > 0 && o.outputHeight <= 16384;
+        }
+        uint32_t ViewportOf(const sl::BaseStructure** inputs, uint32_t numInputs)  // 0xFFFFFFFF = not given
+        {
+            for (uint32_t i = 0; inputs && i < numInputs; ++i) {
+                const sl::BaseStructure* b = inputs[i];
+                if (b && b->structType == sl::ViewportHandle::s_structType)
+                    return static_cast<uint32_t>(*static_cast<const sl::ViewportHandle*>(b));
+            }
+            return 0xFFFFFFFFu;
+        }
         bool                      g_rrTagged = false;
         bool                      g_rrLoaded = false;
         bool                      g_rrLookedUp = false;
@@ -278,11 +319,29 @@ namespace rt
             if (feature == sl::kFeatureDLSS) g_lastDlssEval = GetTickCount64();
             if (feature == sl::kFeatureDLSS && g_rrWanted) {
                 bool use = false;
+                const uint32_t vp = ViewportOf(inputs, numInputs);
                 {
                     std::lock_guard lock(g_rrLock);
-                    use = g_rrOptionsOk && g_rrTagged && g_rrLoaded;
+                    // 0.5.85: only on a viewport whose own DLSS options are valid and were accepted by RR
+                    const ViewportDlss* vs = FindViewport(vp);
+                    use = vs && vs->rrOk && g_rrTagged && g_rrLoaded;
                 }
                 if (g_rrPaused.load()) use = false;
+                // 0.5.105: no RR while the scene loads or settles (every RT effect is paused then, so RR adds nothing),
+                // nor for 2 s after the game switches Frame Generation on or off. 0.5.104 hung entering an interior with
+                // the usual FG signature (only FG's pacer list unfinished) 5 s after the load toggled FG off and on;
+                // the 0.5.84 bisect showed these hangs need FG and RR together.
+                const bool loadHold = rt::SceneSettling();
+                const bool fgHold = GetTickCount64() - g_fgChangedTick.load() < 2000;
+                if (use && (loadHold || fgHold)) {
+                    use = false;
+                    static std::atomic<std::uint64_t> s_heldLog{ 0 };
+                    const std::uint64_t now = GetTickCount64();
+                    if (now - s_heldLog.load() > 5000) {
+                        s_heldLog = now;
+                        REX::INFO("Starfield RT: [RR] held back ({}): DLSS Super Resolution", loadHold ? "scene loading" : "Frame Generation just switched");
+                    }
+                }
                 if (use) {
                     const sl::Result r = g_slEvaluateFeature(sl::kFeatureDLSS_RR, frame, inputs, numInputs, cmd);
                     if (r == sl::Result::eOk) {
@@ -344,13 +403,21 @@ namespace rt
                     REX::INFO("Starfield RT: [RR] DLSS-RR plugin {} (slDLSSDSetOptions {}): {}", loaded ? "loaded" : "NOT loaded",
                         static_cast<int>(r), g_rrLoaded ? "ready" : "staying on DLSS-SR (are sl.dlss_d.dll and nvngx_dlssd.dll next to Starfield.exe?)");
                 }
-                if (g_rrLoaded && g_haveDlss) {
+                const uint32_t vpi = static_cast<uint32_t>(viewport);
+                ViewportDlss* vs = FindViewport(vpi);
+                if (vs && vs->have && !DlssOptionsValid(vs->o)) {
+                    if (vs->rrOk) REX::INFO("Starfield RT: [RR] viewport {}: DLSS off or invalid there (mode {}, {}x{}): no Ray Reconstruction on it",
+                        vpi, static_cast<int>(vs->o.mode), vs->o.outputWidth, vs->o.outputHeight);
+                    vs->rrOk = false;
+                }
+                if (g_rrLoaded && vs && vs->have && DlssOptionsValid(vs->o)) {
+                    const sl::DLSSOptions& d = vs->o;
                     sl::DLSSDOptions o{};
-                    o.mode = g_lastDlss.mode;
-                    o.outputWidth = g_lastDlss.outputWidth;
-                    o.outputHeight = g_lastDlss.outputHeight;
-                    o.preExposure = g_lastDlss.preExposure;
-                    o.exposureScale = g_lastDlss.exposureScale;
+                    o.mode = d.mode;
+                    o.outputWidth = d.outputWidth;
+                    o.outputHeight = d.outputHeight;
+                    o.preExposure = d.preExposure;
+                    o.exposureScale = d.exposureScale;
                     o.colorBuffersHDR = sl::Boolean::eTrue;
                     o.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
                     // Row vectors (Streamline convention): cameraViewToWorld rows = right, up, forward, position.
@@ -372,6 +439,7 @@ namespace rt
                         }
                     }
                     g_rrOptionsOk = res == sl::Result::eOk;
+                    vs->rrOk = res == sl::Result::eOk;
                 }
             }
             return g_slSetConstants(c, frame, viewport);
@@ -396,8 +464,30 @@ namespace rt
                 std::lock_guard lock(g_rrLock);
                 g_lastDlss = o;
                 g_haveDlss = true;
+                const uint32_t vpi = static_cast<uint32_t>(viewport);  // 0.5.85: per viewport
+                if (DlssOptionsValid(o)) {
+                    ViewportDlss& vs = g_vp[vpi];
+                    vs.o = o;
+                    vs.have = true;
+                } else if (g_vp.erase(vpi)) {
+                    REX::INFO("Starfield RT: [RR] viewport {}: DLSS off or invalid there (mode {}, {}x{}): no Ray Reconstruction on it",
+                        vpi, static_cast<int>(o.mode), o.outputWidth, o.outputHeight);
+                }
+                if (g_vp.size() > 64) g_vp.clear();  // safety: never grows without bound
             }
             return g_slDLSSSetOptions(viewport, o);
+        }
+
+        sl::Result H_slDLSSGSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& o)
+        {
+            const int mode = static_cast<int>(o.mode);  // first field in every struct version
+            if (g_fgMode.exchange(mode) != mode) {
+                g_fgChangedTick = GetTickCount64();  // 0.5.105
+                REX::INFO("Starfield RT: [SL] slDLSSGSetOptions viewport {}: Frame Generation {} (mode {}, struct v{})",
+                    static_cast<uint32_t>(viewport), mode == 0 ? "OFF" : mode == 1 ? "ON" : mode == 2 ? "AUTO" : "?", mode,
+                    static_cast<uint32_t>(o.structVersion));
+            }
+            return g_slDLSSGSetOptions(viewport, o);
         }
 
         sl::Result H_slGetFeatureFunction(sl::Feature feature, const char* name, void*& fn)
@@ -407,6 +497,9 @@ namespace rt
             if (r == sl::Result::eOk && fn && name && std::strcmp(name, "slDLSSSetOptions") == 0) {
                 g_slDLSSSetOptions = reinterpret_cast<PFn_slDLSSSetOptions>(fn);
                 fn = reinterpret_cast<void*>(&H_slDLSSSetOptions);
+            } else if (r == sl::Result::eOk && fn && name && std::strcmp(name, "slDLSSGSetOptions") == 0) {  // 0.5.90
+                g_slDLSSGSetOptions = reinterpret_cast<PFn_slDLSSGSetOptions>(fn);
+                fn = reinterpret_cast<void*>(&H_slDLSSGSetOptions);
             }
             return r;
         }
@@ -525,6 +618,8 @@ namespace rt
     bool RayReconstructionWanted() { return g_rrWanted; }
 
     bool ToggleRrPaused() { return !g_rrPaused.exchange(!g_rrPaused.load()); }
+    bool RrPaused() { return g_rrPaused.load(); }  // 0.5.77
+    int FrameGenMode() { return g_fgMode.load(); }  // 0.5.90
     void SetRrPaused(bool paused) { g_rrPaused = paused; }
 
     bool RayReconstructionRunning() { return g_rrWanted && g_rrState.load() == 1 && DlssRunning(); }

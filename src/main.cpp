@@ -40,6 +40,7 @@
 #include <filesystem>
 #include <format>
 #include <mutex>
+#include <tuple>  // 0.5.129: cube survey keys
 #include <string>
 #include <string_view>
 #include <thread>
@@ -128,6 +129,8 @@ namespace
     int g_probeKey = VK_DECIMAL;  // [Debug] iProbeKey: log what rays through the screen centre hit (0 = disabled; 0.4.1: was F8)
     int g_alphaToggleKey = VK_MULTIPLY; // [RT] iAlphaToggleKey: live on/off for alpha-tested RT shadows (0 = disabled; 0.4.1: was F7)
     std::atomic<bool> g_hideGlassProbe{ true };  // [RT] bHideGameGlassReflections: 0.2.39 (G2), toggled live with iGlassReflectionKey
+    ID3D12Resource* g_cubeBlankProbe = nullptr;  // 0.5.130: under g_blackCubeLock
+    bool            g_hideGameCubemaps = true;   // 0.5.130: [RT] bHideGameCubemaps
     int g_glassReflKey = VK_NUMPAD8;             // [RT] iGlassReflectionKey (0.2.41: Numpad 8, was Home)
     std::atomic<bool> g_sharpGlass{ true };      // [RT] bSharpGlass: 0.2.42, toggled live with iSharpGlassKey
     int g_sharpGlassKey = VK_NUMPAD9;            // [RT] iSharpGlassKey
@@ -322,12 +325,24 @@ namespace
     rt::ReflectionSettings  g_baseRefl;
     int                     g_iniReflQuality = 3, g_iniShadowQuality = 3;
     int                     g_appliedRefl = -2, g_appliedShadow = -2;
+    float                   g_iniMinAngle = -1.0f;  // 0.5.100: [RT] fTlasMinScreenSize (-1 = from the quality level)
 
     // 0.5.28: baseline = every effect off and the game's own look everywhere: the game's reflections, GI, lamps and sun
     // shadows, no thin-glass pass, no glass tweaks, Ray Reconstruction paused (plain DLSS), reflection gloss / strength 1.
     // [RT] bStartAllOff applies it at startup and after every quality change (Gameplay Options re-applies all modes);
     // Ctrl+Numpad . applies it live. Each effect's own key then turns it back on, one at a time.
     std::atomic<bool> g_baselineOff{ false };
+    // 0.5.77: F8 master switch. Off remembers what was on and applies the baseline; on restores it (or, if nothing was on,
+    // turns every effect on). Kept off across Gameplay Options changes and save loads until F8 is pressed again.
+    std::atomic<bool> g_masterOff{ false };
+    int g_masterKey = VK_F8;  // [RT] iMasterToggleKey
+    // 0.5.92: Gameplay Options "Ray Tracing" On/Off asks the F8 code (input thread) to switch: -1 nothing, 0 off, 1 on.
+    std::atomic<int> g_menuRtRequest{ -1 };
+    struct MasterState
+    {
+        int refl = 5, gi = 1, lamps = 1, sun = 2, glass = 1;
+        bool rrPaused = false, hideGlassProbe = true, sharpGlass = true, skipThickGlass = true;
+    } g_masterSaved;
 
     void ApplyBaselineOff(const char* why)
     {
@@ -352,20 +367,30 @@ namespace
         rt::ReflectionSettings refl = g_baseRefl;
         if (reflQuality >= 0) {
             // 0.5.11: high 48 within 30 -> 64 within 40, ultra 64 within 40 -> 128 within 60 (NPCs popped into RT up close).
-            constexpr float kSkinRadius[5] = { 20.0f, 10.0f, 20.0f, 40.0f, 60.0f };
+            // 0.5.88: retuned from the 0.5.87 PERF timings (Neon, 3440x1440 DLAA, everything on): Ultra 66 ms per frame
+            // (GI 23.3 ms, reflections 17.7, lamps 4.0, TLAS 1.6), High 34-41 ms (reflections 9-15 ms, GI 2-3).
+            // Reflections now trace 1 ray per 2x2 pixels on every level (Ray Reconstruction fills in); the scene range and
+            // character radius come back from 0.5.71's 10 km / 100 m (TLAS build 0.6 -> 1.6 ms for objects barely visible).
+            constexpr float kSkinRadius[5] = { 20.0f, 10.0f, 20.0f, 40.0f, 60.0f };    // ultra 100 -> 60 again
             constexpr int   kSkinSlots[5] = { 32, 16, 32, 64, 128 };
-            constexpr int   kScale[5] = { 2, 2, 2, 1, 1 };
-            constexpr float kLength[5] = { 1000.0f, 1000.0f, 2000.0f, 3000.0f, 6000.0f };
+            constexpr int   kScale[5] = { 2, 2, 2, 1, 1 };                               // 0.5.89: ultra back to 1 ray per pixel (noise; 2.0 ms at 2x2 with DLSS Quality); 0.5.107: high too (soak test: High too noisy, Numpad 0 removed it)
+            constexpr float kLength[5] = { 1000.0f, 1000.0f, 1500.0f, 3000.0f, 5000.0f };  // ultra 10000 -> 5000; 0.5.92: medium 2000 -> 1500
+            constexpr int kCull[5] = { 1500, 1000, 1200, 2500, 4000 };                   // ultra 10000 -> 4000, high 3000 -> 2500; 0.5.92: medium 1500 -> 1200
+            blas.tlasCullDistance = kCull[reflQuality];
+            // 0.5.100: objects smaller than this on screen (bounding radius / distance) are left out: about 3 px radius at
+            // 3440 wide on Ultra, 4 on High, 6 on Medium, 8 on Low.
+            constexpr float kMinAngle[5] = { 0.004f, 0.004f, 0.003f, 0.002f, 0.0015f };
+            blas.tlasMinAngle = g_iniMinAngle >= 0.0f ? g_iniMinAngle : kMinAngle[reflQuality];
             blas.skinRadius = kSkinRadius[reflQuality];
             blas.skinSlots = kSkinSlots[reflQuality];
             refl.startOn = reflQuality > 0;
             refl.traceScale = kScale[reflQuality];
             refl.maxDistance = kLength[reflQuality];
-            refl.hitShadows = reflQuality >= 2;
+            refl.hitShadows = reflQuality >= 3;  // 0.5.92: High and Ultra only (was Medium too)
             // 0.4.8: GI and RT lamps follow the reflection level too. Ultra = everything at full quality.
-            constexpr int kGiScale[5] = { 2, 2, 2, 2, 1 };
-            constexpr int kGiRays[5] = { 1, 1, 1, 1, 2 };
-            constexpr int kLampShadows[5] = { 2, 2, 4, 4, 8 };
+            constexpr int kGiScale[5] = { 2, 4, 2, 2, 2 };        // 0.5.88: ultra 1 -> 2 (23 ms of the 66); 0.5.92: low/medium 4x4; 0.5.93: medium back to 2x2 (4x4 saved ~1 ms but looked blotchy and crawled)
+            constexpr int kGiRays[5] = { 1, 1, 1, 2, 4 };       // 0.5.89: more rays per cell (noise); GI was 2.5 ms on Ultra
+            constexpr int kLampShadows[5] = { 2, 1, 2, 4, 8 };  /* 0.5.92: medium 4 -> 2, low 2 -> 1 */    // 0.5.88: 16 -> 8 (the lamp pass caps at 8 anyway)
             refl.giTraceScale = kGiScale[reflQuality];
             refl.giRays = kGiRays[reflQuality];
             refl.localShadowRays = kLampShadows[reflQuality];
@@ -373,7 +398,7 @@ namespace
         if (shadowQuality >= 0) {  // High = the 0.2.x defaults
             constexpr int kRays[5] = { 0, 1, 2, 4, 8 };
             constexpr int kScale[5] = { 2, 2, 2, 2, 1 };
-            constexpr int kLength[5] = { 0, 1000, 1500, 2000, 3000 };
+            constexpr int kLength[5] = { 0, 1000, 1500, 2000, 4000 };  // 0.5.88: ultra 10000 -> 4000
             if (shadowQuality == 0) {
                 sun.mode = 0;
             } else {
@@ -395,11 +420,12 @@ namespace
         g_appliedShadow = shadowQuality;
         static constexpr const char* kLevel[6] = { "custom", "off", "low", "medium", "high", "ultra" };
         REX::INFO("Starfield RT: quality ({}): reflections {} (on {}, 1 ray per {}x{}, length {}, hit shadows {}, characters {} within {}), "
-                  "GI 1 cell per {}x{} with {} ray(s), lamp shadows {}, shadows {} (mode {}, {} rays, length {})", source,
+                  "GI 1 cell per {}x{} with {} ray(s), lamp shadows {}, shadows {} (mode {}, {} rays, length {}), RT scene range {}", source,
             kLevel[reflQuality + 1], refl.startOn, refl.traceScale, refl.traceScale, refl.maxDistance, refl.hitShadows, blas.skinSlots,
             blas.skinRadius, refl.giTraceScale, refl.giTraceScale, refl.giRays, refl.localShadowRays, kLevel[shadowQuality + 1], sun.mode,
-            sun.rays, sun.maxDistance);
-        if (g_baselineOff.load()) ApplyBaselineOff(source);  // 0.5.28
+            sun.rays, sun.maxDistance, blas.tlasCullDistance);
+        REX::INFO("Starfield RT: RT scene: objects smaller than {:.4f} (radius / distance) left out", blas.tlasMinAngle);
+        if (g_baselineOff.load() || g_masterOff.load()) ApplyBaselineOff(source);  // 0.5.28; 0.5.77: + F8 off
     }
 
     // 0.2.36: Gameplay Options (StarfieldRT.esm). Its quest script copies the two options into these globals on every
@@ -408,18 +434,22 @@ namespace
     // tasks). Before, a render thread called TESForm::LookupByEditorID every 120 frames until it found them: it walked
     // the game's form table while the main thread was still filling it at startup and at the end of every load. Each load
     // crash of 2026-11-21 came within ~2 s of that lookup (the "Gameplay Options found" line).
-    std::atomic<RE::TESGlobal*> g_optRefl{ nullptr }, g_optShadow{ nullptr };
+    // 0.5.92: one option, Ray Tracing On / Off (global SFRT_RayTracing). It works like F8: Off switches every RT effect
+    // off, On switches them back on. Quality comes from the ini (iReflectionQuality / iShadowQuality). Acted on only when
+    // the value changes, so F8 still works in between; the first read after a load applies it.
+    std::atomic<RE::TESGlobal*> g_optRt{ nullptr };
+    std::atomic<RE::TESGlobal*> g_optQuality{ nullptr };  // 0.5.94: Ray Tracing Quality, 1 low .. 4 ultra
     std::atomic<bool>           g_optLookupQueued{ false };
 
     void LookupGameOptionsMainThread()
     {
-        auto* refl = RE::TESForm::LookupByEditorID<RE::TESGlobal>("SFRT_ReflectionQuality");
-        auto* shadow = RE::TESForm::LookupByEditorID<RE::TESGlobal>("SFRT_ShadowQuality");
-        if (refl && shadow) {
-            g_optRefl = refl;
-            g_optShadow = shadow;
-            REX::INFO("Starfield RT: Gameplay Options found (StarfieldRT.esm, main thread): reflections {}, shadows {}", refl->GetValue(),
-                shadow->GetValue());
+        auto* rt = RE::TESForm::LookupByEditorID<RE::TESGlobal>("SFRT_RayTracing");
+        auto* q = RE::TESForm::LookupByEditorID<RE::TESGlobal>("SFRT_RTQuality");
+        if (rt) {
+            g_optQuality = q;  // may be missing with an older StarfieldRT.esm
+            g_optRt = rt;
+            REX::INFO("Starfield RT: Gameplay Options found (StarfieldRT.esm, main thread): Ray Tracing {}, quality {}", rt->GetValue(),
+                q ? q->GetValue() : -1.0f);
         }
         g_optLookupQueued = false;
     }
@@ -427,10 +457,10 @@ namespace
     void PollGameOptions(std::uint64_t frame)
     {
         static bool reported = false, badValue = false;
+        static int last = -1;
         if (frame % 30 != 0) return;
-        RE::TESGlobal* refl = g_optRefl.load();
-        RE::TESGlobal* shadow = g_optShadow.load();
-        if (!refl || !shadow) {
+        RE::TESGlobal* rtOpt = g_optRt.load();
+        if (!rtOpt) {
             // Not found at data load: ask the main thread to look again now and then (never from this thread).
             if (frame % 600 == 0 && !g_optLookupQueued.exchange(true)) {
                 if (const auto* tasks = SFSE::GetTaskInterface()) {
@@ -441,27 +471,36 @@ namespace
             }
             if (!reported && frame >= 3600) {
                 reported = true;
-                REX::INFO("Starfield RT: StarfieldRT.esm not active, quality comes from the ini only");
+                REX::INFO("Starfield RT: StarfieldRT.esm not active, no Gameplay Options switch (F8 and the ini only)");
             }
             return;
         }
-        auto level = [](RE::TESGlobal* g, int ini, int current) {
-            if (ini < 0) return ini;  // custom: the ini decides
-            const float v = g->GetValue();
-            if (!(v >= -0.01f && v <= 4.01f) || std::abs(v - std::round(v)) > 0.01f) {
-                if (!badValue) {
-                    badValue = true;
-                    REX::WARN("Starfield RT: Gameplay Options global holds {}, not a level; ignoring the menu", v);
-                }
-                return current;
+        const float v = rtOpt->GetValue();
+        if (!(v >= -0.01f && v <= 1.01f) || std::abs(v - std::round(v)) > 0.01f) {
+            if (!badValue) {
+                badValue = true;
+                REX::WARN("Starfield RT: Gameplay Options global holds {}, not 0 or 1; ignoring the menu", v);
             }
-            return static_cast<int>(std::lround(v));
-        };
-        const int r = level(refl, g_iniReflQuality, g_appliedRefl);
-        const int s = level(shadow, g_iniShadowQuality, g_appliedShadow);
-        if (r != g_appliedRefl || s != g_appliedShadow) ApplyQuality(r, s, "Gameplay Options");
+            return;
+        }
+        // 0.5.94: the quality selector (1..4) sets both levels unless the ini says -1 (custom). It is applied even while Ray
+        // Tracing is Off (ApplyQuality keeps everything off then), so On comes back at the chosen quality.
+        if (RE::TESGlobal* qOpt = g_optQuality.load()) {
+            const float qv = qOpt->GetValue();
+            if (qv >= 0.99f && qv <= 4.01f && std::abs(qv - std::round(qv)) <= 0.01f) {
+                const int ql = static_cast<int>(std::lround(qv));
+                const int r = g_iniReflQuality < 0 ? g_iniReflQuality : ql;
+                const int s = g_iniShadowQuality < 0 ? g_iniShadowQuality : ql;
+                if (r != g_appliedRefl || s != g_appliedShadow) ApplyQuality(r, s, "Gameplay Options");
+            }
+        }
+        const int on = static_cast<int>(std::lround(v));
+        if (on != last) {
+            last = on;
+            REX::INFO("Starfield RT: Gameplay Options: Ray Tracing {}", on ? "On" : "Off");
+            g_menuRtRequest = on;
+        }
     }
-
     void LoadSettingsAndTools()
     {
         const auto ini = (PluginDirectory() / L"StarfieldRT.ini").wstring();
@@ -490,6 +529,19 @@ namespace
         const int reflQuality = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iReflectionQuality", 3, ini.c_str())), -1, 4);
         const int shadowQuality = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iShadowQuality", 3, ini.c_str())), -1, 4);
         blas.tlasMaxExtent = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iTlasMaxInstanceSize", 1000, ini.c_str()));
+        {  // 0.5.100: -1 = follow the quality level; 0 = off
+            wchar_t buf[32]{};
+            GetPrivateProfileStringW(L"RT", L"fTlasMinScreenSize", L"-1", buf, 32, ini.c_str());
+            g_iniMinAngle = static_cast<float>(_wtof(buf));
+            blas.tlasMinAngle = g_iniMinAngle >= 0.0f ? g_iniMinAngle : blas.tlasMinAngle;
+        }
+        {  // 0.5.106: after-load timing
+            wchar_t a[32]{}, b[32]{};
+            GetPrivateProfileStringW(L"RT", L"fRtSettleSeconds", L"2", a, 32, ini.c_str());
+            GetPrivateProfileStringW(L"RT", L"fRtFadeSeconds", L"1.5", b, 32, ini.c_str());
+            rt::SetLoadTiming(static_cast<float>(_wtof(a)), static_cast<float>(_wtof(b)));
+            REX::INFO("Starfield RT: after a load: wait {} s once the scene is ready, then fade in over {} s", static_cast<float>(_wtof(a)), static_cast<float>(_wtof(b)));
+        }
         blas.alphaTest = GetPrivateProfileIntW(L"RT", L"bAlphaTest", 1, ini.c_str()) != 0;
         blas.glassSeparate = GetPrivateProfileIntW(L"RT", L"bGlassSeparate", 1, ini.c_str()) != 0;  // 0.2.44
         g_glassSeparateKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGlassSeparateKey", VK_NUMPAD7, ini.c_str()));
@@ -513,6 +565,7 @@ namespace
         sun.rays = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iSunShadowRays", 4, ini.c_str()));
         sun.maxBlurPx = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iSoftShadowMaxBlur", 4, ini.c_str()));
         sun.softScale = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iSoftShadowScale", 2, ini.c_str()));
+        sun.phantomDetect = GetPrivateProfileIntW(L"RT", L"bPhantomDetect", 1, ini.c_str()) != 0;  // 0.5.134
         {
             wchar_t buf[32]{};
             GetPrivateProfileStringW(L"RT", L"fSunAngularRadiusDeg", L"0.15", buf, 32, ini.c_str());
@@ -520,6 +573,7 @@ namespace
         }
         g_softToggleKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iSoftToggleKey", VK_DIVIDE, ini.c_str()));
         g_hideGlassProbe = GetPrivateProfileIntW(L"RT", L"bHideGameGlassReflections", 1, ini.c_str()) != 0;  // 0.2.39 (G2)
+        g_hideGameCubemaps = GetPrivateProfileIntW(L"RT", L"bHideGameCubemaps", 1, ini.c_str()) != 0;  // 0.5.130
         g_glassReflKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGlassReflectionKey", VK_NUMPAD8, ini.c_str()));
         g_sharpGlass = GetPrivateProfileIntW(L"RT", L"bSharpGlass", 1, ini.c_str()) != 0;  // 0.2.42
         g_sharpGlassKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iSharpGlassKey", VK_NUMPAD9, ini.c_str()));
@@ -555,7 +609,7 @@ namespace
             refl.blurPx = static_cast<float>(_wtof(buf));
             GetPrivateProfileStringW(L"RT", L"fReflectionGloss", L"0.65", buf, 32, ini.c_str());  // 0.5.24
             refl.glossRoughScale = (std::clamp)(static_cast<float>(_wtof(buf)), 0.2f, 1.0f);
-            GetPrivateProfileStringW(L"RT", L"fReflectionStrength", L"0.5", buf, 32, ini.c_str());
+            GetPrivateProfileStringW(L"RT", L"fReflectionStrength", L"1.0", buf, 32, ini.c_str());  // 0.5.133: default 0.5 -> 1
             refl.glossStrength = (std::clamp)(static_cast<float>(_wtof(buf)), 0.5f, 3.0f);
             refl.replaceAll = GetPrivateProfileIntW(L"RT", L"bReplaceGameReflections", 1, ini.c_str()) != 0;
             GetPrivateProfileStringW(L"RT", L"fReflectionProbeAmbient", L"2.5", buf, 32, ini.c_str());
@@ -568,10 +622,16 @@ namespace
             GetPrivateProfileStringW(L"RT", L"fGlassRoughnessScale", L"0.0", buf, 32, ini.c_str());
             refl.glassRoughScale = static_cast<float>(_wtof(buf));
             refl.thinGlass = GetPrivateProfileIntW(L"RT", L"bThinGlassReflections", 1, ini.c_str()) != 0 ? 1 : 0;  // 0.2.51 (G3)
-            refl.thinGlassFallback = GetPrivateProfileIntW(L"RT", L"bThinGlassUntaggedFallback", 0, ini.c_str()) != 0;  // 0.4.10
+            refl.thinGlassFallback = GetPrivateProfileIntW(L"RT", L"bThinGlassUntaggedFallback", 1, ini.c_str()) != 0;  // 0.4.10, 0.5.61 default 1
+            refl.thinGlassScoreGate = GetPrivateProfileIntW(L"RT", L"bThinGlassSmokeFilter", 1, ini.c_str()) != 0;  // 0.5.61
+            refl.thinGlassStandoffScore = GetPrivateProfileIntW(L"RT", L"bThinGlassStandoffScore", 1, ini.c_str()) != 0;  // 0.5.96
             GetPrivateProfileStringW(L"RT", L"fThinGlassMinCoverage", L"0.001", buf, 32, ini.c_str());  // 0.2.55: < 0 = no gate
             refl.thinGlassMinCoverage = static_cast<float>(_wtof(buf));
-            GetPrivateProfileStringW(L"RT", L"fThinGlassStrength", L"3.0", buf, 32, ini.c_str());
+            refl.reflectSmoke = GetPrivateProfileIntW(L"RT", L"bSmokeInReflections", 1, ini.c_str()) != 0;  // 0.5.71
+            refl.reflShadeCache = GetPrivateProfileIntW(L"RT", L"bReflectionMatchScreen", 1, ini.c_str()) != 0;  // 0.5.75
+            GetPrivateProfileStringW(L"RT", L"fThinGlassBlurPx", L"8.0", buf, 32, ini.c_str());  // 0.5.70
+            refl.thinGlassBlurPx = static_cast<float>(_wtof(buf));
+            GetPrivateProfileStringW(L"RT", L"fThinGlassStrength", L"1.0", buf, 32, ini.c_str());  // 0.5.81: default 3 -> 1.5; 0.5.114: 1.0 (tester: too strong)
             refl.thinGlassStrength = static_cast<float>(_wtof(buf));
             g_thinGlassKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iThinGlassKey", VK_NUMPAD4, ini.c_str()));
             refl.localLights = GetPrivateProfileIntW(L"RT", L"bReflectionLocalLights", 1, ini.c_str()) != 0;  // 0.2.58
@@ -590,10 +650,10 @@ namespace
             refl.reflTemporal = GetPrivateProfileIntW(L"RT", L"bReflectionTemporal", 1, ini.c_str()) != 0;  // 0.3.4
             GetPrivateProfileStringW(L"RT", L"fEmissiveScale", L"1.0", buf, 32, ini.c_str());  // 0.3.6
             refl.emissiveScale = static_cast<float>(_wtof(buf));
-            refl.emissiveModel = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iEmissiveModel", 0, ini.c_str())), 0, 1);
+            refl.emissiveModel = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iEmissiveModel", 1, ini.c_str())  /* 0.5.122: default 1 */), 0, 1);
             GetPrivateProfileStringW(L"RT", L"fGIFilterRadius", L"6.0", buf, 32, ini.c_str());
             refl.giRadius = static_cast<float>(_wtof(buf));
-            refl.giTraceScale = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGITraceScale", 2, ini.c_str())), 1, 2);
+            refl.giTraceScale = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGITraceScale", 2, ini.c_str())), 1, 4);  // 0.5.92: 4 allowed
             refl.giRays = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGIRays", 1, ini.c_str())), 1, 8);  // 0.4.8
             g_giKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGIKey", VK_NUMPAD1, ini.c_str()));
             GetPrivateProfileStringW(L"RT", L"fGIScreenLight", L"1.0", buf, 32, ini.c_str());  // 0.3.3
@@ -601,8 +661,11 @@ namespace
             g_onScreenMessages = GetPrivateProfileIntW(L"RT", L"bOnScreenMessages", 1, ini.c_str()) != 0;  // 0.3.1
             refl.rtLamps = GetPrivateProfileIntW(L"RT", L"bRTLamps", 1, ini.c_str()) != 0;  // 0.4.0
             refl.hitLampShadowRays = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iHitLampShadowRays", 0, ini.c_str()));  // 0.4.5
+            refl.giLampShadowRays = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iGILampShadowRays", 2, ini.c_str()));  // 0.5.136
             GetPrivateProfileStringW(L"RT", L"fRTLampScale", L"1.0", buf, 32, ini.c_str());
             refl.rtLampScale = static_cast<float>(_wtof(buf));
+            GetPrivateProfileStringW(L"RT", L"fRTLampSoftness", L"0.25", buf, 32, ini.c_str());  // 0.5.79
+            refl.rtLampRadius = static_cast<float>(_wtof(buf));
             g_rtLampKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iRTLampKey", VK_NUMPAD2, ini.c_str()));
             g_reflBrighterKey = static_cast<int>(GetPrivateProfileIntW(L"Debug", L"iReflectionBrighterKey", VK_ADD, ini.c_str()));
             g_reflDarkerKey = static_cast<int>(GetPrivateProfileIntW(L"Debug", L"iReflectionDarkerKey", VK_SUBTRACT, ini.c_str()));
@@ -613,6 +676,7 @@ namespace
         g_iniReflQuality = reflQuality;
         g_iniShadowQuality = shadowQuality;
         g_baselineOff = GetPrivateProfileIntW(L"RT", L"bStartAllOff", 0, ini.c_str()) != 0;  // 0.5.28
+        g_masterKey = static_cast<int>(GetPrivateProfileIntW(L"RT", L"iMasterToggleKey", VK_F8, ini.c_str()));  // 0.5.77
         ApplyQuality(reflQuality, shadowQuality, "ini");
         REX::INFO("Starfield RT: settings iSunShadows={} iSunRayLength={} bias {} + {}/unit, iTlasMaxInstanceSize={}, bAlphaTest={}",
             sun.mode, sun.maxDistance, sun.biasBase, sun.biasPerUnit, blas.tlasMaxExtent, blas.alphaTest);
@@ -918,6 +982,8 @@ namespace
         }
         const UINT slices = isArray ? v.texDepthOrArray : 6u;  // 0.2.43: recorded shape, no call into the texture
         if (slices < 6) return;
+        // 0.5.130: the probe array found here is blanked everywhere (DeviceHooks) while RT reflections are on.
+        const bool registerProbe = isArray && v.texture != g_cubeBlankProbe;
         BlackCube* black = nullptr;
         for (auto& b : g_blackCubes) {
             if (b.format == v.format && b.array == isArray && b.slices >= slices) { black = &b; break; }
@@ -948,6 +1014,12 @@ namespace
             REX::INFO("Starfield RT: [G2] black {} created ({} slices, format {})", isArray ? "cube array" : "cube", slices,
                 static_cast<int>(v.format));
         }
+        if (registerProbe && black->array && black->slices == slices) {
+            g_cubeBlankProbe = v.texture;
+            rt::SetCubemapBlanking(v.texture, black->res.Get(), v.format, slices);
+            REX::INFO("Starfield RT: [cubes] game reflection-probe array {:p} ({} slices, format {}) is blanked everywhere while RT reflections are on",
+                static_cast<void*>(v.texture), slices, static_cast<int>(v.format));
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
         if (!rt::GpuTableToCpu(table, kProbeEntry, cpu)) return;
         D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
@@ -967,6 +1039,47 @@ namespace
             REX::INFO("Starfield RT: [G2] glass probe reflection hidden (table {:#x}, heap index {}, {}, {} swaps so far)", table.ptr,
                 rt::HeapIndexOf(table), isArray ? "probe array" : "material cube", n + 1);
         }
+    }
+    // 0.5.129: cube survey. The game still draws a cubemap reflection on glossy sign panels with RT reflections on (same
+    // image with RT on and off, coverage view all green), so some pass other than GatherIndirect applies probes. For a
+    // few frames after a Numpad . probe, every descriptor table bound (graphics or compute) is scanned for cube / cube
+    // array views; each (pass, kind, root slot, entry, texture) is logged once.
+    thread_local int           t_curPass = -1;  // hooked pass executing on this thread (-1 = none)
+    std::atomic<std::uint64_t> g_cubeSurveyUntil{ 0 };
+    std::mutex                 g_cubeSurveyLock;
+    std::vector<std::tuple<int, bool, UINT, std::uint32_t, void*>> g_cubeSurveySeen;
+    std::uint64_t CurrentFrame();
+    void CubeSurvey(bool compute, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE h)
+    {
+        if (!h.ptr || CurrentFrame() > g_cubeSurveyUntil.load(std::memory_order_relaxed)) return;
+        for (std::uint32_t e = 0; e < 32; ++e) {
+            rt::BufferView v{};
+            if (!rt::LookupGpuTableAny(h, e, v) || !v.texture) continue;
+            const bool arr = v.viewDim == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, cube = v.viewDim == D3D12_SRV_DIMENSION_TEXTURECUBE;
+            if (!arr && !cube) continue;
+            const auto key = std::make_tuple(t_curPass, compute, index, e, static_cast<void*>(v.texture));
+            {
+                std::lock_guard lock(g_cubeSurveyLock);
+                if (g_cubeSurveySeen.size() >= 300) return;
+                bool seen = false;
+                for (const auto& k : g_cubeSurveySeen) seen |= k == key;
+                if (seen) continue;
+                g_cubeSurveySeen.push_back(key);
+            }
+            REX::INFO("Starfield RT: [cubes] pass {} | {} root param {} table {:#x} (heap {}) +{}: {} {}x{} x{} slices, {} mips, format {}, texture {:p}",
+                t_curPass >= 0 ? g_passes[t_curPass].name : "(not a hooked pass)", compute ? "compute" : "graphics", index, h.ptr,
+                rt::HeapIndexOf(h), e, arr ? "cube array" : "cube", v.texWidth, v.texHeight, v.texDepthOrArray, v.texMips,
+                static_cast<int>(v.format), static_cast<void*>(v.texture));
+        }
+    }
+    void ArmCubeSurvey()
+    {
+        {
+            std::lock_guard lock(g_cubeSurveyLock);
+            g_cubeSurveySeen.clear();
+        }
+        g_cubeSurveyUntil = CurrentFrame() + 3;
+        REX::INFO("Starfield RT: [cubes] cube survey armed for frames {}..{}", CurrentFrame(), CurrentFrame() + 3);
     }
     std::atomic<bool>  g_indirectSurveyRequest{ false };
     std::atomic<bool>  g_indirectSurveyDone{ false };
@@ -1214,6 +1327,7 @@ namespace
     {
         if (!t_injecting && index < 16) StateFor(l).graphicsTables[index] = h;
         if (!t_injecting && index == 1) NoteTable1(h.ptr);  // 0.2.54
+        if (!t_injecting) CubeSurvey(false, index, h);  // 0.5.129
         if (t_inOitTransparency && index == 4 && h.ptr) {
             if (g_hideGlassProbe.load(std::memory_order_relaxed)) HideGlassProbe(h);  // 0.2.39 (G2)
             if (g_sharpGlass.load(std::memory_order_relaxed)) SharpenGlassView(h);   // 0.2.42
@@ -1331,6 +1445,7 @@ namespace
         if (!t_injecting && index < kTrackedRootParams) StateFor(l).computeTables[index] = h;
         if (!t_injecting && index == 1) NoteTable1(h.ptr);
         if (!t_injecting && index == 4) NoteLightTable(l, h);  // 0.2.58
+        if (!t_injecting) CubeSurvey(true, index, h);  // 0.5.129
         Orig<void(STDMETHODCALLTYPE*)(L*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE)>(kSetComputeRootDescriptorTable)(l, index, h);
     }
     // 0.4.3: compute root descriptors, tracked so injected work can restore them.
@@ -1593,6 +1708,7 @@ namespace
         list->SetPipelineState(g_maskTest.pso);
         list->SetComputeRoot32BitConstants(0, 4, consts, 0);
         list->SetComputeRootDescriptorTable(1, uav);
+        rt::DredMark(list, L"SFRT main maskTest #1");
         list->Dispatch((extentX + 7) / 8, (extentY + 7) / 8, 1);
         list->ResourceBarrier(1, &uavBarrier);  // make our writes visible to the next pass
         // Restore exactly what the engine had bound.
@@ -1864,9 +1980,82 @@ namespace
             explicit OitFlag(bool on) : prev(t_inOitTransparency) { if (on) t_inOitTransparency = true; }
             ~OitFlag() { t_inOitTransparency = prev; }
         } oitFlag(static_cast<int>(I) == g_oitTransparencyPass);
+        struct PassScope  // 0.5.129: which hooked pass this thread is in (cube survey)
+        {
+            int prev;
+            bool noBlank;
+            // 0.5.131: GatherIndirect keeps the game's probes (its ambient light uses them; we replace its reflection
+            // output anyway). Riding the Jemison tram, everything went very dark with the probes blanked there.
+            explicit PassScope(int i) : prev(t_curPass), noBlank(i == g_gatherIndirectPass)
+            {
+                t_curPass = i;
+                if (noBlank) rt::SuppressCubemapBlankingOnThisThread(true);
+            }
+            ~PassScope()
+            {
+                t_curPass = prev;
+                if (noBlank) rt::SuppressCubemapBlankingOnThisThread(false);
+            }
+        } passScope(static_cast<int>(I));
         if (static_cast<int>(I) == g_oitCompositePass && g_listHooksReady) {
             // 0.2.51 (G3): after the OIT composite (glass blended into the HDR target), add RT reflections on thin glass.
+            // 0.5.83: this frame's camera. The transparency draws recorded just before on this list bind PerSceneConstants
+            // (a 53,008-byte CBV); the reflection pass's copy is from whichever frame recorded it last, often the previous
+            // one (passes are recorded on several threads), which made glass reflections lag and jump while turning.
+            D3D12_GPU_VIRTUAL_ADDRESS perSceneNow = 0;
+            for (std::size_t tb = 0; tb < t_state.graphicsTables.size() && !perSceneNow; ++tb) {
+                const auto h = t_state.graphicsTables[tb];
+                if (!h.ptr) continue;
+                for (std::uint32_t e = 0; e < 4 && !perSceneNow; ++e) {
+                    rt::BufferView v{};
+                    if (rt::LookupGpuTable(h, e, v) && v.cbv && v.sizeBytes >= 53008 && v.sizeBytes <= 53248)  // not the 64 KB lamp data
+                        perSceneNow = v.gpuva;
+                }
+            }
             const auto r = original(self, ctx, resources);
+            // 0.5.84: the transparency tables didn't hold it (0.5.83 log: not found). The global scene table bound for the
+            // composite draw (root table 1) keeps a copy of PerSceneConstants at entry 34, as the RT build reads it.
+            int camSource = perSceneNow ? 1 : 0;
+            if (const auto g = t_state.graphicsTables[1]; g.ptr) {
+                rt::BufferView v{};
+                if (rt::LookupGpuTable(g, 34, v) && v.cbv && v.sizeBytes >= 53008 && v.sizeBytes <= 53248) {
+                    perSceneNow = v.gpuva;
+                    camSource = 2;
+                }
+            }
+            if (!perSceneNow) {  // and the composite's own tables, after its draw
+                for (std::size_t tb = 0; tb < t_state.graphicsTables.size() && !perSceneNow; ++tb) {
+                    const auto h = t_state.graphicsTables[tb];
+                    if (!h.ptr) continue;
+                    for (std::uint32_t e = 0; e < 4 && !perSceneNow; ++e) {
+                        rt::BufferView v{};
+                        if (rt::LookupGpuTable(h, e, v) && v.cbv && v.sizeBytes >= 53008 && v.sizeBytes <= 53248) {
+                            perSceneNow = v.gpuva;
+                            camSource = 3;
+                        }
+                    }
+                }
+            }
+            {
+                static std::atomic<int> camLogs{ 0 };
+                const int n = camLogs.fetch_add(1);
+                if (rt::GetTlasAddress() && !rt::SceneSettling() && (n % 3600) < 3) {  // in game, 3 times then every minute
+                    static const char* const kSrc[] = { "none", "transparency pass tables", "global scene table entry 34", "composite tables" };
+                    std::string cbvs;
+                    for (std::size_t tb = 0; tb < 8; ++tb) {
+                        const auto h = t_state.graphicsTables[tb];
+                        if (!h.ptr) continue;
+                        for (std::uint32_t e = 0; e < 4; ++e) {
+                            rt::BufferView v{};
+                            if (rt::LookupGpuTable(h, e, v) && v.cbv) cbvs += std::format(" t{}+{}={}B", tb, e, v.sizeBytes);
+                        }
+                    }
+                    rt::BufferView v34{};
+                    const bool has34 = t_state.graphicsTables[1].ptr && rt::LookupGpuTable(t_state.graphicsTables[1], 34, v34);
+                    REX::INFO("Starfield RT: [G3] camera for thin glass: {} | composite CBVs:{} | table 1 +34: {}", kSrc[camSource],
+                        cbvs.empty() ? " none" : cbvs, has34 ? std::format("{} B{}", v34.sizeBytes, v34.cbv ? " CBV" : "") : std::string("-"));
+                }
+            }
             const char* outcome = "no composite draw seen";
             auto* list = t_state.list;
             const auto t3 = t_state.graphicsTables[3];
@@ -1887,10 +2076,14 @@ namespace
                     outcome = "skipped: depth / moment SRVs not where expected (composite table 3 +0 / +2)";
                 } else {
                     t_injecting = true;
-                    outcome = rt::RecordGlassReflections(GetEngineDevice(), list, target, base + 0, base + 2, rt::GetTlasAddress());
+                    rt::PassTimerBegin(2, GetEngineDevice(), list);  // 0.5.87
+                    outcome = rt::RecordGlassReflections(GetEngineDevice(), list, target, base + 0, base + 2, rt::GetTlasAddress(), perSceneNow);
+                    rt::PassTimerEnd(2, list, std::string_view(outcome) == "applied");
                     if (std::string_view(outcome) == "applied") RestoreComputeState(list, t_state);
                     // 0.3.3: keep this frame's final lit image (glass included) for next frame's GI.
-                    const char* cap = rt::RecordGiCapture(GetEngineDevice(), list, target, base + 0, base + 2);
+                    rt::PassTimerBegin(3, GetEngineDevice(), list);
+                    const char* cap = rt::RecordGiCapture(GetEngineDevice(), list, target, base + 0, base + 2, perSceneNow);
+                    rt::PassTimerEnd(3, list, std::string_view(cap) == "applied");
                     if (std::string_view(cap) == "applied") RestoreComputeState(list, t_state);
                     static const char* capLast = nullptr;
                     if (cap != capLast) {
@@ -2026,14 +2219,20 @@ namespace
                         // 0.3.0: RT diffuse GI into RT0 (the game's indirect diffuse), same inputs.
                         ID3D12Resource* rt0 = nullptr;
                         rt::LookupRtv(t_state.rtvs[0].ptr, rt0, fmt);
+                        rt::PassTimerBegin(0, GetEngineDevice(), list);  // 0.5.87
                         const char* gi = rt::RecordGi(GetEngineDevice(), list, in, rt0);
+                        rt::PassTimerEnd(0, list, std::string_view(gi).starts_with("applied"));
                         if (std::string_view(gi).starts_with("applied")) RestoreComputeState(list, t_state);
                         // 0.4.0: RT direct light from the game's lamps into RT0 (diffuse) and RT1 (specular).
+                        rt::PassTimerBegin(1, GetEngineDevice(), list);
                         const char* lamps = rt::RecordDirectLights(GetEngineDevice(), list, in, rt0, in.target);
+                        rt::PassTimerEnd(1, list, std::string_view(lamps).starts_with("applied"));
                         // 0.5.0: guide images for DLSS Ray Reconstruction; 0.5.4: only while the game is actually running DLSS
                         if (rt::RayReconstructionWanted() && rt0 && rt::DlssRunning()) {
                             const D3D12_RESOURCE_DESC rd = rt0->GetDesc();
+                            rt::PassTimerBegin(4, GetEngineDevice(), list);
                             const char* rr = rt::RecordRrGuides(GetEngineDevice(), list, in, static_cast<UINT>(rd.Width), rd.Height);
+                            rt::PassTimerEnd(4, list, std::string_view(rr).starts_with("applied"));
                             if (std::string_view(rr) == "applied") RestoreComputeState(list, t_state);
                             static const char* rrLast = nullptr;
                             if (rr != rrLast) {
@@ -2069,7 +2268,10 @@ namespace
         }
         // 0.2.6: while RT sun shadows are on, the game's sun cascades (ShadowMapInstance) draw nothing, so the
         // cascade maps stay empty (fully lit) and the RT shadow alone decides what is in sunlight.
-        const bool replaceSun = I == kSunShadowMapPass && g_replaceGameSunShadows != 0 && rt::CurrentSunMode() != 0 && rt::GetTlasAddress() != 0;
+        // 0.5.106: only once RT has fully faded in after a load. Before, the cascades were dropped while the RT sun pass was
+        // paused for the load: no sun shadows at all for several seconds, then RT shadows snapped on.
+        const bool replaceSun = I == kSunShadowMapPass && g_replaceGameSunShadows != 0 && rt::CurrentSunMode() != 0 && rt::GetTlasAddress() != 0 &&
+                                rt::RtFadeIn() >= 1.0f;
         if (replaceSun && g_replaceGameSunShadows == 3) {
             // 0.2.10 default: let the pass draw normally (dropping its draws coincided with Frame Generation hangs),
             // then clear the depth targets it bound with the value the game clears them with, so the sun cascade
@@ -2139,6 +2341,11 @@ namespace
                 }
             }
             g_frameCounter.fetch_add(1);
+            // 0.5.130: the game's cubemap reflections are hidden everywhere while RT reflections are on (they showed on
+            // glossy sign panels next to the RT reflection: the same image with RT on and off).
+            // 0.5.133: and only while RT is fully running: during a load (the tram ride is one, 13-25 s) RT reflections and
+            // GI are paused, and with the probes blanked too, interiors had no reflection and lost light ("tram went dark").
+            rt::EnableCubemapBlanking(g_hideGameCubemaps && rt::ReflectionDebugMode() == 5 && !rt::SceneSettling() && rt::RtFadeIn() >= 1.0f);
             rt::timer::FrameTick(g_frameCounter.load(), rt::CurrentSunMode(), rt::SoftShadowsOn(), rt::AlphaTestOn());
             if (g_frameCounter.load() % 600 == 300) {
                 rt::LogVram(GetEngineDevice(), "every 600 frames");  // 0.2.33
@@ -2181,6 +2388,47 @@ namespace
                 }
             }
             toggleWasDown = toggleDown;
+            static bool masterWasDown = false;  // 0.5.77: F8 = every RT effect off / back on
+            const bool masterDown = g_masterKey && (GetAsyncKeyState(g_masterKey) & 0x8000) != 0;
+            const int menuReq = g_menuRtRequest.exchange(-1);  // 0.5.92: Gameplay Options On/Off
+            const bool rtIsOff = g_masterOff.load() || g_baselineOff.load();
+            const bool wantToggle = (masterDown && !masterWasDown) || (menuReq == 0 && !rtIsOff) || (menuReq == 1 && rtIsOff);
+            if (wantToggle) {
+                if (!g_masterOff.load() && !(menuReq == 1 && g_baselineOff.load())) {
+                    MasterState& m = g_masterSaved;
+                    m.refl = rt::ReflectionDebugMode();
+                    m.gi = rt::GiMode();
+                    m.lamps = rt::DirectLightsMode();
+                    m.sun = rt::CurrentSunMode();
+                    m.glass = rt::ThinGlassMode();
+                    m.rrPaused = rt::RrPaused();
+                    m.hideGlassProbe = g_hideGlassProbe.load();
+                    m.sharpGlass = g_sharpGlass.load();
+                    m.skipThickGlass = g_skipThickGlassLayer.load();
+                    if (m.refl == 0 && m.gi == 0 && m.lamps == 0 && m.sun == 0 && m.glass == 0)
+                        m = MasterState{ 5, 1, 1, g_baseSun.mode ? g_baseSun.mode : 2, 1, false, true, true, true };  // nothing was on: all on next time
+                    g_masterOff = true;
+                    ApplyBaselineOff("F8");
+                    Announce("All RT effects", "OFF (the game's own look). F8 turns them back on");
+                } else {
+                    const MasterState& m = g_masterSaved;
+                    g_masterOff = false;
+                    g_baselineOff = false;  // a later Gameplay Options change must not switch everything off again
+                    rt::SetReflectionModeRaw(m.refl);
+                    rt::SetGiModeRaw(m.gi);
+                    rt::SetDirectLightsRaw(m.lamps);
+                    rt::SetSunShadowsLive(m.sun);
+                    rt::SetThinGlassMode(m.glass);
+                    rt::SetRrPaused(m.rrPaused);
+                    g_hideGlassProbe = m.hideGlassProbe;
+                    g_sharpGlass = m.sharpGlass;
+                    g_skipThickGlassLayer = m.skipThickGlass;
+                    REX::INFO("Starfield RT: F8: effects restored (reflections {}, GI {}, RT lamps {}, sun shadows {}, thin glass {}, RR {})",
+                        m.refl, m.gi, m.lamps, m.sun, m.glass, m.rrPaused ? "paused" : "on");
+                    Announce("All RT effects", "ON (reflections, GI, RT lamps, sun shadows, thin glass, Ray Reconstruction as before)");
+                }
+            }
+            masterWasDown = masterDown;
             static bool probeWasDown = false;  // debug probe: what do rays through the screen centre hit?
             const bool probeDown = g_probeKey && (GetAsyncKeyState(g_probeKey) & 0x8000) != 0;
             if (probeDown && !probeWasDown && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {  // 0.5.28: Ctrl+Numpad . = baseline
@@ -2193,6 +2441,7 @@ namespace
                 rt::RequestGlassDump();         // 0.2.62: what the thin-glass pass hits at the screen centre
                 g_indirectSurveyRequest = true;  // 0.2.22: also re-run the R1 GatherIndirect survey
                 ArmGlassSurvey("F8");            // 0.2.38: and the G1 glass survey
+                ArmCubeSurvey();                 // 0.5.129: every pass binding a cubemap
                 Announce("Probe", "captured, see the log");
             }
             probeWasDown = probeDown;
@@ -2201,6 +2450,9 @@ namespace
             if (reflDown && !reflWasDown) {
                 if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // 0.5.13: Ctrl+Numpad 0 = Ray Reconstruction on/off
                     Announce("DLSS Ray Reconstruction", rt::ToggleRrPaused() ? "off (plain DLSS)" : "on");
+                } else if (GetAsyncKeyState(VK_MENU) & 0x8000) {  // 0.5.72: Alt+Numpad 0 = reflection source view
+                    Announce("Reflection source view", rt::ToggleReflSourceView()
+                        ? "on (green = from the screen; ray traced: red = off screen, yellow = distance mismatch, white = smoke/glass/metal, magenta = hit right at its start; blue = no hit)" : "off");
                 } else {
                     const int mode = rt::CycleReflectionDebug();
                     if (mode == 5) {  // 0.5.43: RT reflections on -> Ray Reconstruction on too (it settles their noise)
@@ -2216,13 +2468,18 @@ namespace
             const bool upDown = g_reflBrighterKey && (GetAsyncKeyState(g_reflBrighterKey) & 0x8000) != 0;
             const bool dnDown = g_reflDarkerKey && (GetAsyncKeyState(g_reflDarkerKey) & 0x8000) != 0;
             const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (upDown && !upWasDown) {
+            const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;  // 0.5.81: Alt+Numpad + / - = thin-glass reflection brightness
+            if (upDown && !upWasDown && alt) {
+                Announce("Thin-glass reflections", std::format("brighter, fThinGlassStrength {:.2f}", rt::AdjustThinGlassStrength(1.25f)));
+            } else if (dnDown && !downWasDown && alt) {
+                Announce("Thin-glass reflections", std::format("dimmer, fThinGlassStrength {:.2f}", rt::AdjustThinGlassStrength(0.8f)));
+            } else if (upDown && !upWasDown) {
                 if (ctrl)  // 0.5.24: Ctrl+Numpad + / - = glossier / softer reflections
                     Announce("Reflection gloss", std::format("sharper, fReflectionGloss {:.2f}", rt::AdjustReflectionGloss(-0.05f)));
                 else
                     Announce("Reflection brightness", std::format("up, fReflectionProbeAmbient {:.2f}", rt::AdjustReflectionBrightness(1.25f)));
             }
-            if (dnDown && !downWasDown) {
+            else if (dnDown && !downWasDown) {
                 if (ctrl)
                     Announce("Reflection gloss", std::format("softer, fReflectionGloss {:.2f}", rt::AdjustReflectionGloss(0.05f)));
                 else
@@ -2300,6 +2557,9 @@ namespace
                 if (GetAsyncKeyState(VK_CONTROL) & 0x8000)  // 0.5.32: Ctrl+Numpad 5 = probe floor for off-screen reflection hits
                     Announce("Off-screen reflection hits", rt::ToggleOffscreenProbeFloor() ? "never darker than the game's probe"
                                                                                              : "ray-traced only (can go dark)");
+                else if (GetAsyncKeyState(VK_MENU) & 0x8000)  // 0.5.75: Alt+Numpad 5 = learned per-object correction
+                    Announce("Off-screen reflection colour", rt::ToggleReflShadeCache() ? "matched to the game's on-screen colour"
+                                                                                          : "our shading only (the 0.5.74 look)");
                 else
                     Announce("Game lamps in reflections/GI", rt::ToggleLocalLights() ? "on" : "off (sun + ambient only)");
             }
@@ -2307,18 +2567,34 @@ namespace
             static bool thinWasDown = false;  // 0.2.51 (G3): thin-glass RT reflections on/off
             const bool thinDown = g_thinGlassKey && (GetAsyncKeyState(g_thinGlassKey) & 0x8000) != 0;
             if (thinDown && !thinWasDown) {
-                if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // 0.5.13: Ctrl+Numpad 4 = untagged-window search on/off
+                if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)) {  // 0.5.95: Ctrl+Alt+Numpad 4 = screen colours (Shift+Numpad is an arrow key with NumLock)
+                    Announce("Thin glass: colours from last frame's image", rt::ToggleThinGlassScreenColours() ? "on" : "off (ray-traced colours only)");
+                } else if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // 0.5.13: Ctrl+Numpad 4 = untagged-window search on/off
                     Announce("Thin glass: untagged-window search", rt::ToggleThinGlassFallback() ? "on" : "off (tagged glass only)");
+                } else if (GetAsyncKeyState(VK_MENU) & 0x8000) {  // 0.5.61: Alt+Numpad 4 = smoke filter (per-object score)
+                    Announce("Thin glass: smoke filter", rt::ToggleThinGlassScoreGate() ? "on (only objects the game draws as glass)"
+                                                                                       : "off (per-pixel coverage only, as before)");
                 } else {
-                    static const char* const kThin[3] = { "off", "on", "debug colours (yellow/white = reflected, magenta = glass missed, blue = no glass)" };
-                    Announce("RT reflections on thin glass", kThin[rt::ToggleThinGlass()]);
+                    static const char* const kThin[3] = { "off", "on",
+                        "debug colours (yellow/white = reflected, green = fading in, orange = smoke-only object filtered, magenta = glass missed, blue = no glass)" };
+                    const int thin = rt::ToggleThinGlass();
+                    // 0.5.62: the glass pass needs the RT reflection pass (its inputs and lighting); say so instead of
+                    // reporting "on" while it silently skips.
+                    if (thin != 0 && rt::ReflectionDebugMode() != 5)
+                        Announce("RT reflections on thin glass", thin == 1 ? "on, but NOT RUNNING: turn RT reflections on (Numpad 0)"
+                                                                           : "debug colours, but NOT RUNNING: turn RT reflections on (Numpad 0)");
+                    else
+                        Announce("RT reflections on thin glass", kThin[thin]);
                 }
             }
             thinWasDown = thinDown;
             static bool sepWasDown = false;  // 0.2.44: glass skipped by shadow and reflection rays, on/off
             const bool sepDown = g_glassSeparateKey && (GetAsyncKeyState(g_glassSeparateKey) & 0x8000) != 0;
             if (sepDown && !sepWasDown) {
-                Announce("See-through surfaces in reflections", rt::ToggleGlassSeparate() ? "skipped" : "solid");
+                if (GetAsyncKeyState(VK_MENU) & 0x8000)  // 0.5.71: Alt+Numpad 7 = smoke in reflections
+                    Announce("Smoke in reflections", rt::ToggleReflectSmoke() ? "on" : "off (surfaces behind smoke are ray traced)");
+                else
+                    Announce("See-through surfaces in reflections", rt::ToggleGlassSeparate() ? "skipped" : "solid");
             }
             sepWasDown = sepDown;
             static bool litWasDown = false;  // 0.2.4: lit test

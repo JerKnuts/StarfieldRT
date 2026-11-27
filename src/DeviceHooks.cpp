@@ -258,6 +258,7 @@ namespace rt
             v.texFormat = d.Format;
         }
 
+        void BlankIfProbe(ID3D12Device* d, Heap* heap, const BufferView* v, SIZE_T cpu);  // 0.5.130, below
         using CreateSrvFn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
         void STDMETHODCALLTYPE H_CreateShaderResourceView(ID3D12Device* d, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dst)
         {
@@ -284,6 +285,7 @@ namespace rt
                     RecordTextureShape(*slot, r);
                     slot->format = desc ? desc->Format : slot->texFormat;
                     slot->viewDim = desc ? static_cast<std::uint32_t>(desc->ViewDimension) : 4;  // TEXTURE2D
+                    BlankIfProbe(d, heap, slot, dst.ptr);  // 0.5.130
                 }
             }
         }
@@ -341,7 +343,33 @@ namespace rt
             }
         }
 
-        void CopyRange(SIZE_T dst, SIZE_T src, UINT n)
+        // 0.5.130: cubemap blanking (see DeviceHooks.h).
+        std::atomic<ID3D12Resource*> g_blankProbe{ nullptr };
+        std::atomic<ID3D12Resource*> g_blankBlack{ nullptr };
+        std::atomic<DXGI_FORMAT>     g_blankFormat{ DXGI_FORMAT_UNKNOWN };
+        std::atomic<UINT>            g_blankSlices{ 0 };
+        std::atomic<bool>            g_blankOn{ false };
+        std::atomic<std::uint64_t>   g_blankCount{ 0 };
+        thread_local bool            t_noBlank = false;  // 0.5.131
+        void BlankIfProbe(ID3D12Device* d, Heap* heap, const BufferView* v, SIZE_T cpu)
+        {
+            if (t_noBlank || !heap || !heap->gpuStart || !v || v->uav || !v->texture || !g_blankOn.load(std::memory_order_relaxed)) return;
+            ID3D12Resource* probe = g_blankProbe.load(std::memory_order_relaxed);
+            ID3D12Resource* black = g_blankBlack.load(std::memory_order_relaxed);
+            if (!probe || !black || v->texture != probe || v->viewDim != D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) return;
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = g_blankFormat.load(std::memory_order_relaxed);
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+            sd.TextureCubeArray.MipLevels = 1;
+            sd.TextureCubeArray.NumCubes = g_blankSlices.load(std::memory_order_relaxed) / 6;
+            // The game's views may cover fewer cubes than the array; ours covers them all (indices stay in range).
+            reinterpret_cast<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*,
+                D3D12_CPU_DESCRIPTOR_HANDLE)>(g_orig[kCreateShaderResourceView])(d, black, &sd, D3D12_CPU_DESCRIPTOR_HANDLE{ cpu });
+            g_blankCount.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        void CopyRange(ID3D12Device* d, SIZE_T dst, SIZE_T src, UINT n)
         {
             for (UINT i = 0; i < n; ++i) {
                 Heap* sheap = nullptr;
@@ -353,6 +381,7 @@ namespace rt
                 if (t) {
                     SetOwnedFrom(heap, index, s ? sheap : nullptr, sindex);  // 0.5.17
                     *t = s ? *s : BufferView{};
+                    BlankIfProbe(d, heap, t, dst + SIZE_T(i) * g_increment);  // 0.5.130
                 }
             }
         }
@@ -363,7 +392,7 @@ namespace rt
             reinterpret_cast<CopySimpleFn>(g_orig[kCopyDescriptorsSimple])(d, n, dst, src, type);
             if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
                 std::shared_lock lock(g_heapLock);
-                CopyRange(dst.ptr, src.ptr, n);
+                CopyRange(d, dst.ptr, src.ptr, n);
                 g_copies.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -384,7 +413,7 @@ namespace rt
                 const UINT dsz = dstSizes ? dstSizes[di] : 1;
                 const UINT ssz = srcSizes ? srcSizes[si] : 1;
                 const UINT run = (std::min)(dsz - doff, ssz - soff);
-                CopyRange(dstStarts[di].ptr + SIZE_T(doff) * g_increment, srcStarts[si].ptr + SIZE_T(soff) * g_increment, run);
+                CopyRange(d, dstStarts[di].ptr + SIZE_T(doff) * g_increment, srcStarts[si].ptr + SIZE_T(soff) * g_increment, run);
                 doff += run;
                 soff += run;
                 if (doff == dsz) { ++di; doff = 0; }
@@ -556,6 +585,7 @@ namespace rt
 
         bool                       g_dredWanted = false;
         bool                       g_dredOn = false;
+        bool                       g_dredMarks = false;  // 0.5.123
         std::atomic<bool>          g_removedLogged{ false };
 
         void TurnOnDred()
@@ -566,6 +596,13 @@ namespace rt
                 settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                 settings->Release();
                 g_dredOn = true;
+                // 0.5.123: DRED 1.2 breadcrumb contexts (the text of SetMarker calls), for DredMark.
+                ID3D12DeviceRemovedExtendedDataSettings1* settings1 = nullptr;
+                if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&settings1))) && settings1) {
+                    settings1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    settings1->Release();
+                    g_dredMarks = true;
+                }
                 REX::INFO("Starfield RT: DRED on (auto-breadcrumbs and page-fault reporting) for crash diagnostics");
             } else {
                 REX::WARN("Starfield RT: DRED unavailable (D3D12GetDebugInterface failed)");
@@ -618,6 +655,17 @@ namespace rt
     }
 
     void EnableDred(bool on) { g_dredWanted = on; }
+    void SetCubemapBlanking(ID3D12Resource* probeArray, ID3D12Resource* black, DXGI_FORMAT format, UINT slices)
+    {
+        g_blankFormat = format;
+        g_blankSlices = slices;
+        g_blankBlack = black;
+        g_blankProbe = probeArray;
+    }
+    void EnableCubemapBlanking(bool on) { g_blankOn = on; }
+    void SuppressCubemapBlankingOnThisThread(bool on) { t_noBlank = on; }
+    std::uint64_t CubemapBlankCount() { return g_blankCount.load(); }
+    bool DredMarksOn() { return g_dredMarks; }
 
     ID3D12Resource* FindUploadBuffer(D3D12_GPU_VIRTUAL_ADDRESS va, std::uint64_t& offset)
     {
@@ -676,6 +724,23 @@ namespace rt
             shared.CurrentUsage * mb);
     }
 
+    float VramUsedFraction(ID3D12Device* device)  // 0.5.100
+    {
+        if (!device) return 0.0f;
+        std::lock_guard lock(g_vramLock);
+        if (!g_adapterTried) {
+            g_adapterTried = true;
+            Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+                factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&g_adapter));
+            }
+        }
+        if (!g_adapter) return 0.0f;
+        DXGI_QUERY_VIDEO_MEMORY_INFO local{};
+        if (FAILED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) || !local.Budget) return 0.0f;
+        return static_cast<float>(static_cast<double>(local.CurrentUsage) / static_cast<double>(local.Budget));
+    }
+
     bool CheckDeviceRemoved(ID3D12Device* device)
     {
         if (!device) return false;
@@ -698,21 +763,78 @@ namespace rt
             LogAllocations("existing", fault.pHeadExistingAllocationNode);
             LogAllocations("recently freed", fault.pHeadRecentFreedAllocationNode);
         }
+        // 0.5.123: DRED 1.2 output with breadcrumb contexts (our DredMark labels). For each unfinished list: the ops
+        // around where the GPU stopped, the last plugin label at or before that op (the pass it was in, if ours), and
+        // every plugin label in the list.
+        ID3D12DeviceRemovedExtendedData1* dred1 = nullptr;
+        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs1{};
+        const bool have1 = SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred1))) && dred1 && SUCCEEDED(dred1->GetAutoBreadcrumbsOutput1(&crumbs1));
         D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs{};
-        if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs))) {
-            int lists = 0;
-            for (const auto* node = crumbs.pHeadAutoBreadcrumbNode; node && lists < 64; node = node->pNext, ++lists) {
+        const D3D12_AUTO_BREADCRUMB_NODE* head0 = nullptr;
+        if (!have1 && SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs))) head0 = crumbs.pHeadAutoBreadcrumbNode;
+        const auto opName = [](D3D12_AUTO_BREADCRUMB_OP op) -> const char* {
+            switch (op) {
+            case D3D12_AUTO_BREADCRUMB_OP_SETMARKER: return "marker";
+            case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT: return "begin event";
+            case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT: return "end event";
+            case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED: return "draw";
+            case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED: return "draw indexed";
+            case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT: return "execute indirect";
+            case D3D12_AUTO_BREADCRUMB_OP_DISPATCH: return "dispatch";
+            case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION: return "copy buffer";
+            case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION: return "copy texture";
+            case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE: return "copy resource";
+            case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW: return "clear RTV";
+            case D3D12_AUTO_BREADCRUMB_OP_CLEARUNORDEREDACCESSVIEW: return "clear UAV";
+            case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW: return "clear DSV";
+            case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER: return "barrier";
+            case D3D12_AUTO_BREADCRUMB_OP_WRITEBUFFERIMMEDIATE: return "write immediate";
+            case D3D12_AUTO_BREADCRUMB_OP_BUILDRAYTRACINGACCELERATIONSTRUCTURE: return "AS build";
+            case D3D12_AUTO_BREADCRUMB_OP_DISPATCHRAYS: return "dispatch rays";
+            case D3D12_AUTO_BREADCRUMB_OP_EXECUTEMETACOMMAND: return "meta command";
+            case D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH: return "dispatch mesh";
+            case D3D12_AUTO_BREADCRUMB_OP_BEGIN_COMMAND_LIST: return "begin list";
+            default: return nullptr;
+            }
+        };
+        const auto logList = [&](const std::string& name, const void* list, UINT done, UINT count, const D3D12_AUTO_BREADCRUMB_OP* hist,
+                                 const D3D12_DRED_BREADCRUMB_CONTEXT* ctx, UINT nctx) {
+            REX::INFO("Starfield RT: DRED   unfinished command list '{}' ({:p}): {} of {} ops done", name, list, done, count);
+            for (UINT i = done > 3 ? done - 3 : 0; i < count && i < done + 3; ++i) {
+                const char* on = opName(hist[i]);
+                REX::INFO("Starfield RT: DRED     op {}{}: {}", i, i == done ? " (<- GPU stopped here)" : "",
+                    on ? std::string(on) : std::to_string(static_cast<int>(hist[i])));
+            }
+            if (!ctx || !nctx) return;
+            const D3D12_DRED_BREADCRUMB_CONTEXT* last = nullptr;
+            std::string all;
+            for (UINT k = 0; k < nctx; ++k) {
+                if (ctx[k].BreadcrumbIndex <= done && (!last || ctx[k].BreadcrumbIndex >= last->BreadcrumbIndex)) last = &ctx[k];
+                if (all.size() < 1500) all += std::format(" [{}] {}", ctx[k].BreadcrumbIndex, Narrow(ctx[k].pContextString));
+            }
+            if (last) REX::INFO("Starfield RT: DRED     last label before the stop: op {} '{}' ({} ops later)", last->BreadcrumbIndex,
+                Narrow(last->pContextString), done - last->BreadcrumbIndex);
+            else REX::INFO("Starfield RT: DRED     no label before the stop");
+            REX::INFO("Starfield RT: DRED     labels in this list:{}", all);
+        };
+        int lists = 0;
+        if (have1) {
+            for (const auto* node = crumbs1.pHeadAutoBreadcrumbNode; node && lists < 64; node = node->pNext, ++lists) {
                 const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
                 if (done >= node->BreadcrumbCount) continue;  // this list finished
                 const std::string name = node->pCommandListDebugNameA ? node->pCommandListDebugNameA : Narrow(node->pCommandListDebugNameW);
-                REX::INFO("Starfield RT: DRED   unfinished command list '{}' ({:p}): {} of {} ops done", name,
-                    static_cast<void*>(node->pCommandList), done, node->BreadcrumbCount);
-                for (UINT i = done > 3 ? done - 3 : 0; i < node->BreadcrumbCount && i < done + 3; ++i) {
-                    REX::INFO("Starfield RT: DRED     op {}{}: {}", i, i == done ? " (<- GPU stopped here)" : "",
-                        static_cast<int>(node->pCommandHistory[i]));
-                }
+                logList(name, node->pCommandList, done, node->BreadcrumbCount, node->pCommandHistory, node->pBreadcrumbContexts,
+                    node->BreadcrumbContextsCount);
+            }
+        } else {
+            for (const auto* node = head0; node && lists < 64; node = node->pNext, ++lists) {
+                const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+                if (done >= node->BreadcrumbCount) continue;
+                const std::string name = node->pCommandListDebugNameA ? node->pCommandListDebugNameA : Narrow(node->pCommandListDebugNameW);
+                logList(name, node->pCommandList, done, node->BreadcrumbCount, node->pCommandHistory, nullptr, 0);
             }
         }
+        if (dred1) dred1->Release();
         dred->Release();
         return true;
     }

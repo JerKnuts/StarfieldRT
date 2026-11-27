@@ -3,6 +3,7 @@
 #include <SFSE/SFSE.h>  // CommonLibSF must come before any Windows headers
 
 #include "GpuTimer.h"
+#include "StreamlineHooks.h"  // 0.5.90: Frame Generation state
 
 #include <wrl/client.h>
 
@@ -128,9 +129,10 @@ namespace rt::timer
             if (!g_frames) return;
             const double frameMs = g_frameSum / g_frames;
             const double blas = Avg(kAfterBlas), tlas = Avg(kAfterTlas), shadow = Avg(kAfterShadow), filter = Avg(kAfterFilter);
-            REX::INFO("Starfield RT: PERF RT mode {} soft {} alpha {} ({} frames): frame {:.2f} ms ({:.0f} fps) | plugin GPU: "
+            const int fg = rt::FrameGenMode();  // 0.5.90: with FG on, the frame is a rendered frame; the screen shows about twice the fps
+            REX::INFO("Starfield RT: PERF RT mode {} soft {} alpha {} FG {} ({} frames): frame {:.2f} ms ({:.0f} fps rendered) | plugin GPU: "
                       "BLAS {:.2f} + TLAS {:.2f} + shadow rays {:.2f} + soft filter {:.2f} = {:.2f} ms | plugin CPU {:.2f} ms",
-                g_lastMode, g_lastSoft ? "on" : "off", g_lastAlpha ? "on" : "off", g_frames, frameMs,
+                g_lastMode, g_lastSoft ? "on" : "off", g_lastAlpha ? "on" : "off", fg == 1 ? "on" : fg == 2 ? "auto" : "off"  /* -1: the game never set FG options this session (it only does once FG is first switched on) */, g_frames, frameMs,
                 frameMs > 0.0 ? 1000.0 / frameMs : 0.0, blas, tlas, shadow, filter, blas + tlas + shadow + filter,
                 g_cpuN ? g_cpuSum / g_cpuN : 0.0);
         }

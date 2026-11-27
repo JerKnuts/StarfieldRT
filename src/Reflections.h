@@ -32,8 +32,15 @@ namespace rt
         unsigned smoothGlassTypes = 4;  // 0.2.46: bit n = G-buffer material type n is glass (0.2.47: default type 2 = glass)
         float glassRoughScale = 0.0f;   // 0.2.46: 0 = mirror-smooth glass, 1 = the game's roughness
         int   thinGlass = 1;            // 0.2.51 (G3): RT reflections on thin (see-through) glass: 0 off, 1 on, 2 stage debug view
-        float thinGlassStrength = 3.0f; // 0.2.51: scales them (1 = Fresnel of real glass)
+        float thinGlassStrength = 1.5f; // 0.2.51: scales them (1 = Fresnel of real glass); 0.5.81: default 3 -> 1.5
         bool  thinGlassFallback = true;  // 0.4.10: untagged windows found by "any object in front of the wall"
+        bool  thinGlassScoreGate = true; // 0.5.61: only objects the game really draws as glass reflect (smoke filter)
+        bool  thinGlassStandoffScore = true;  // 0.5.96: pane-vs-surface test decided per object (stops patch flicker)
+        bool  thinGlassScreenColours = true;  // 0.5.95: on-screen hits take last frame's image colour (Shift+Numpad 4)
+        float thinGlassBlurPx = 8.0f;   // 0.5.70: blur radius of thin-glass reflections, pixels at 1440p (0 = sharp); 0.5.71: 4 -> 8
+        bool  reflShadeCache = true;    // 0.5.75: off-screen reflection hits use each object's learned on-screen correction
+        bool  reflSourceView = false;   // 0.5.72: debug: colour reflections by where their colour came from (Alt+Numpad 0)
+        bool  reflectSmoke = true;      // 0.5.71: on-screen reflection hits behind smoke take the smoky colour (smoke shows in reflections)
         float thinGlassMinCoverage = 0.001f;  // 0.2.51: OIT optical depth b0 below this = no see-through surface; < 0 = no gate
         bool  localLights = true;       // 0.2.58: light reflection hits with the game's local lights
         bool  offscreenProbeFloor = true;  // 0.5.32: off-screen reflection hits never darker than the game's probe
@@ -54,7 +61,9 @@ namespace rt
         int   emissiveModel = 0;        // 0.3.6: 0 adaptive (2^offset / exposure), 1 luminous emittance (absolute)
         bool  rtLamps = true;           // 0.4.0: the game's lamps are drawn by us with RT shadows (the game's are switched off)
         float rtLampScale = 1.0f;       // 0.4.0: their brightness (1 = the game's)
+        float rtLampRadius = 0.25f;     // 0.5.79: lamp size for soft lamp shadows, metres (0 = hard)
         int   hitLampShadowRays = 0;    // 0.4.5: lamp shadow rays at reflection / GI hits (0 = unshadowed: much less noise)
+        int   giLampShadowRays = 2;     // 0.5.136: the same for GI hits only (GI is accumulated over frames, so noise matters less)
     };
     void SetReflectionSettings(const ReflectionSettings& s);
 
@@ -69,6 +78,13 @@ namespace rt
     void SetGiModeRaw(int mode);          // 0 off, 1 on, 2 debug
     void SetDirectLightsRaw(int mode);    // 0 = the game's lamps, 1 = RT lamps
     void SetThinGlassMode(int mode);      // 0 off, 1 on, 2 debug colours
+    int  ThinGlassMode();                 // 0.5.77 (F8 master switch)
+    // 0.5.126: GPU address of the "glass-tagged but drawn solid" bits (1 per instance record), or 0. Always a UAV.
+    D3D12_GPU_VIRTUAL_ADDRESS GlassSolidBits();
+    // 0.5.87: GPU time of a recorded call, averaged and logged every 600 frames as "PERF <name>". Channels:
+    // 0 GI, 1 RT lamps, 2 thin glass, 3 last-frame image capture, 4 RR guide images. counted = the call recorded work.
+    void PassTimerBegin(int channel, ID3D12Device* device, ID3D12GraphicsCommandList* list);
+    void PassTimerEnd(int channel, ID3D12GraphicsCommandList* list, bool counted);
     void SetReflectionLook(float gloss, float strength);
     // 0.5.24: live art controls for RT reflections. Each returns the new value (delta 0 = just read it).
     float AdjustReflectionGloss(float delta);     // roughness scale, 0.2..1 (lower = sharper)
@@ -96,7 +112,8 @@ namespace rt
     // (R11G11B10, RENDER_TARGET state); depthIndex / momentIndex are heap indices of the composite's depth and b0 SRVs.
     // Uses the inputs of this frame's reflection pass. Caller restores compute state and the PSO when it returns "applied".
     const char* RecordGlassReflections(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* target,
-        std::uint32_t depthIndex, std::uint32_t momentIndex, D3D12_GPU_VIRTUAL_ADDRESS tlas);
+        std::uint32_t depthIndex, std::uint32_t momentIndex, D3D12_GPU_VIRTUAL_ADDRESS tlas,
+        D3D12_GPU_VIRTUAL_ADDRESS perSceneNow = 0);  // 0.5.83: this frame's PerScene (0 = the reflection pass's)
     int ToggleThinGlass();  // 0.2.55: cycles on -> debug -> off -> on
 
     // 0.3.0: RT diffuse GI into the game's indirect diffuse target (GatherIndirect RT0, R11G11B10, RENDER_TARGET state),
@@ -114,6 +131,12 @@ namespace rt
     void SetRrRaw(bool on);
     // 0.5.13: Ctrl+Numpad 4: the untagged-window fallback of the thin-glass pass on/off. Returns the new state.
     bool ToggleThinGlassFallback();
+    bool ToggleThinGlassScoreGate();  // 0.5.61: Alt+Numpad 4
+    bool ToggleThinGlassScreenColours();  // 0.5.95: Shift+Numpad 4
+    bool ToggleReflectSmoke();        // 0.5.71: Alt+Numpad 7
+    bool ToggleReflSourceView();      // 0.5.72: Alt+Numpad 0
+    bool ToggleReflShadeCache();      // 0.5.75: Alt+Numpad 5
+    float AdjustThinGlassStrength(float factor);  // 0.5.81: Alt+Numpad + / -; returns the new fThinGlassStrength
     bool ToggleRrRaw();
     // 0.5.0: DLSS Ray Reconstruction guide images at the DLSS input size, written on `list` (caller restores compute state
     // when it returns "applied"). GetRrGuides: diffuse albedo, specular albedo, normal+roughness, specular hit distance,
@@ -129,7 +152,7 @@ namespace rt
     // 0.3.3: after the OIT composite: keep this frame's lit image (HDR target, RENDER_TARGET state) and per-pixel distance
     // (depth SRV heap index) for next frame's GI. Caller restores compute state when it returns "applied".
     const char* RecordGiCapture(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* target, std::uint32_t depthIndex,
-        std::uint32_t momentIndex);  // 0.3.9: OIT optical depth: covered pixels are not used
+        std::uint32_t momentIndex, D3D12_GPU_VIRTUAL_ADDRESS perSceneNow = 0);  // 0.3.9: OIT optical depth: covered pixels are not used
 
     // 0.2.58: the game's local-light buffer (TiledDeferredLight cb2 space4, 64 KB) and its index ranges (t0 space4, 48 B),
     // captured when the main view's lighting pass binds them. 0.2.60: copied into our own buffer on that pass's command

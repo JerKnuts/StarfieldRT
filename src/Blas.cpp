@@ -1,4 +1,4 @@
-﻿// BLAS builder (see Blas.h).
+// BLAS builder (see Blas.h).
 // Mesh record (52 B): +0 position handle, +28 bone-weight handle (0 = rigid), +32 index count,
 // +36 first index (uint16 units into the #132 pool), +44 vertex count, +48 position scale.
 // Handle: slot = v & 0x3FFF (heap index 32768 + slot), offset = (v >> 6) & 0xFFFF00.
@@ -12,12 +12,16 @@
 #include "generated/CopyGeometryCS.h"    // 0.1.34: compiled from shaders/CopyGeometry.hlsl
 #include "GpuTimer.h"
 #include "Reflections.h"  // 0.2.63: ForgetReflectionInputs
+#include "RtShadows.h"    // 0.5.134: PhantomBits
 
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <format>
+#include <string>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -519,6 +523,7 @@ namespace rt
                 list4->SetComputeRoot32BitConstants(0, 6, j.consts, 0);
                 list4->SetComputeRootShaderResourceView(1, j.vertices);
                 const UINT threads = (std::max)(j.consts[0], (j.consts[1] + 1) / 2);
+                rt::DredMark(list4, L"SFRT Blas staging #1");
                 list4->Dispatch((threads + 63) / 64, 1, 1);
             }
             D3D12_RESOURCE_BARRIER toRead{};
@@ -533,6 +538,7 @@ namespace rt
             for (auto& j : jobs) {
                 if (j.scratchBarrier) list4->ResourceBarrier(1, &uavAll);
                 j.build.Inputs.pGeometryDescs = &j.geom;
+                rt::DredMark(list4, L"SFRT Blas AS build #2");
                 list4->BuildRaytracingAccelerationStructure(&j.build, 0, nullptr);
             }
             list4->ResourceBarrier(1, &uavAll);  // results complete before the TLAS build and next frame's scratch use
@@ -576,11 +582,26 @@ namespace rt
             std::uint64_t               countFrames = 0;         // frames with a counter copy in flight
             std::uint32_t               glassCount = 0;          // 0.2.44: active instances tagged as glass
             std::uint32_t               playerCount = 0;         // 0.2.67: skinned instances tagged as the first-person player
+            std::uint32_t               sizeCulled = 0;          // 0.5.100: left out as too small on screen
+            std::uint32_t               breakdown[11]{};         // 0.5.101: distance x4, radius x4, alpha, effect, characters
+            std::uint32_t               dupMesh = 0, dupPlace = 0;  // 0.5.102: same mesh at the same place; any mesh at a taken place
         } g_tlas;
         std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> g_tlasAddress{ 0 };
         std::atomic<bool>          g_sceneLoading{ false };
         std::atomic<std::uint64_t> g_quietUntil{ 0 };  // 0.3.7: frame until which effects other than shadows wait
         std::atomic<std::uint64_t> g_lastFrame{ 0 };
+        // 0.5.103: frames per second (smoothed). The post-load waits were counted in frames, so at 35 fps rendered they
+        // lasted 2.6 s (calm) + 5 s (quiet). Now they are the shorter of the old frame count and a fixed time.
+        float g_fps = 60.0f;
+        std::atomic<std::uint32_t> g_tableDumpReq{ 0 };  // 0.5.111: 0x80000000 | family << 16 | material
+        float g_settleSeconds = 2.0f;  // 0.5.106: ini fRtSettleSeconds
+        float g_fadeSeconds = 1.5f;    // 0.5.106: ini fRtFadeSeconds (0.5.104 had 0.75 s)
+        std::atomic<long long> g_settleEndNs{ 0 };  // 0.5.104: steady_clock time when settling last ended (0 = still settling)
+        std::uint64_t WaitFrames(std::uint64_t oldFrames, float seconds, std::uint64_t floorFrames)
+        {
+            const auto timed = static_cast<std::uint64_t>(g_fps * seconds);
+            return (std::min)(oldFrames, (std::max)(floorFrames, timed));
+        }
 
         // ---------------------------------------------------------------- 0.2.32: skinned characters
         // Skinned instances (NPCs, the player) near the camera get a slot: every frame a compute pass writes the
@@ -589,7 +610,7 @@ namespace rt
         // 0.5.11: 64 -> 128 slots (Ultra crowds filled 64 fast: a character is several instances).
         constexpr std::uint32_t kSkinSlotsMax = 128;    // SkinSlots table layout: 128 ids, then 128 addresses at +512
         constexpr std::uint32_t kSkinAddrOffset = kSkinSlotsMax * 4;  // must match BuildInstances.hlsl
-        constexpr std::uint32_t kSkinCandidates = 256;  // must match BuildInstances.hlsl
+        constexpr std::uint32_t kSkinCandidates = 2048;  // must match BuildInstances.hlsl; 0.5.119: 256 -> 2048 (Neon filled 256, cut off in GPU order before the nearest-first sort)
         constexpr std::uint64_t kSkinCandBytes = 16 + kSkinCandidates * 16;
         constexpr std::uint64_t kSkinStaleFrames = 30;  // a slot whose instance stopped being a candidate is freed after this
 
@@ -620,6 +641,50 @@ namespace rt
             std::uint64_t               built = 0, lastLog = 0;
         } g_skin;
         std::atomic<bool> g_skinDumpRequested{ false };  // 0.5.52
+        // 0.5.66: near-camera instance dump (Numpad .): BuildInstances writes it into the counter buffer after +64.
+        constexpr std::uint64_t kCounterBytes = 64 + 48 * 64;            // near-camera dump (read back on request)
+        constexpr std::uint64_t kCounterAllocBytes = 4096 + 2 * (1u << 19) * 4;  // 0.5.102: + duplicate counts at 4088 and two hash tables
+
+        // 0.5.100: while local VRAM is nearly full (Jemison soak test: 97% of budget, 90-100 ms frames), shrink the RT scene
+        // range and raise the size-on-screen cut, in steps once a second; grow back once there is room again.
+        float g_vramScale = 1.0f;
+        float VramPressureScale(ID3D12Device* device, std::uint64_t frame)
+        {
+            static std::uint64_t last = 0;
+            if (frame - last < 60) return g_vramScale;
+            last = frame;
+            const float used = VramUsedFraction(device);
+            const float before = g_vramScale;
+            if (used > 0.90f)
+                g_vramScale = (std::max)(0.4f, g_vramScale * 0.85f);
+            else if (used < 0.82f && g_vramScale < 1.0f)
+                g_vramScale = (std::min)(1.0f, g_vramScale * 1.1f);
+            if (g_vramScale != before)
+                REX::INFO("Starfield RT: VRAM {:.0f}% of budget: RT scene range x{:.2f} (size cut x{:.2f})", used * 100.0f, g_vramScale,
+                    1.0f / g_vramScale);
+            return g_vramScale;
+        }
+        std::atomic<bool> g_nearDumpRequested{ false };
+        ComPtr<ID3D12Resource> g_nearDumpReadback;
+        std::uint64_t g_nearDumpFrame = 0;  // frame the copy was recorded (0 = none pending)
+
+        void LogNearDump(const std::uint32_t* d)
+        {
+            const std::uint32_t n = d[4];
+            REX::INFO("Starfield RT: [near] {} instance record(s) within 1.5 m of the camera{}", n, n > 48 ? " (first 48 listed)" : "");
+            for (std::uint32_t i = 0; i < (std::min)(n, 48u); ++i) {
+                const std::uint32_t* e = d + 16 + i * 16;
+                float f[9];
+                std::memcpy(f, e + 4, sizeof(f));
+                const std::uint32_t pk = e[3];
+                REX::INFO("Starfield RT: [near]   record {} mesh {} bones {}: {} {}, hit group {}{}{}{}, half-size {:.2f} m, {:.2f} m from camera, "
+                          "camera - origin ({:.2f}, {:.2f}, {:.2f}), rotation ({:.3f}, {:.3f}, {:.3f}, {:.3f})",
+                    e[0], e[2], e[1], (pk >> 16) & 1u ? "IN TLAS" : "left out", (pk & 8u) ? "non-opaque" : "opaque", (pk >> 8) & 0xFFu,
+                    (pk >> 8) & 0xFFu ? ((pk >> 8) & 0xFFu) == 1u ? " (PLAYER: skipped by reflections)" : " (character)" : "",
+                    (pk >> 17) & 1u ? ", game-skinned this frame" : "", (pk >> 18) & 1u ? ", glass" : (pk >> 19) & 1u ? ", effect" : "",
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]);
+            }
+        }
         // 0.5.50/0.5.53 SlotState layout: [0, 4096) 32 B per slot, 4096 last-move frame, [8192, +128 x 176) probe records
         constexpr std::uint64_t kSkinStateBytes = 8192 + kSkinSlotsMax * 176;
         struct SkinDumpRow { std::uint32_t slot, instance, mesh, verts, tris; float dist; };
@@ -921,6 +986,7 @@ namespace rt
                 list4->SetComputeRoot32BitConstants(0, 9, c, 0);
                 list4->SetComputeRootUnorderedAccessView(6, s->vb->GetGPUVirtualAddress());
                 list4->SetComputeRootUnorderedAccessView(7, s->ib->GetGPUVirtualAddress());
+                rt::DredMark(list4, L"SFRT Blas skin #3");
                 list4->Dispatch(((std::max)(s->vcount, s->icount) + 63) / 64, 1, 1);
             }
             if (dumpNow) {  // 0.5.53
@@ -959,6 +1025,7 @@ namespace rt
                 b.Inputs.pGeometryDescs = &geom;
                 b.DestAccelerationStructureData = s->blas->GetGPUVirtualAddress();
                 b.ScratchAccelerationStructureData = g_skin.scratch->GetGPUVirtualAddress() + s->scratchOffset;
+                rt::DredMark(list4, L"SFRT Blas AS build #4");
                 list4->BuildRaytracingAccelerationStructure(&b, 0, nullptr);
                 s->builtThisFrame = true;
                 ++g_skin.built;
@@ -975,9 +1042,9 @@ namespace rt
 
         bool CreateInstancePipeline(ID3D12Device* device)
         {
-            D3D12_ROOT_PARAMETER p[12]{};
+            D3D12_ROOT_PARAMETER p[14]{};
             p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-            p[0].Constants = { 0, 0, 13 };
+            p[0].Constants = { 0, 0, 16 };  // 0.5.100: + MinAngle; 0.5.126: + UseSolidBits; 0.5.134: + UsePhantomBits
             for (UINT i = 0; i < 4; ++i) {
                 p[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
                 p[1 + i].Descriptor = { i, 0 };
@@ -996,8 +1063,12 @@ namespace rt
             p[10].Descriptor = { 6, 0 };
             p[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;  // u2 skinned candidates (0.2.32)
             p[11].Descriptor = { 2, 0 };
+            p[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;  // u3 drawn-solid bits (0.5.126)
+            p[12].Descriptor = { 3, 0 };
+            p[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;  // u4 phantom bits (0.5.134)
+            p[13].Descriptor = { 4, 0 };
             for (auto& q : p) q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            const D3D12_ROOT_SIGNATURE_DESC desc{ 12, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+            const D3D12_ROOT_SIGNATURE_DESC desc{ 14, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
             ComPtr<ID3DBlob> blob, error;
             if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
                 FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&g_tlas.rootSig)))) {
@@ -1012,7 +1083,7 @@ namespace rt
                 return false;
             }
             // 0.2.2: active-instance counter and its read-back ring.
-            g_tlas.counter = CreateGpuBuffer(device, 256, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g_tlas.counter = CreateGpuBuffer(device, kCounterAllocBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);  // 0.5.66: + near dump
             D3D12_HEAP_PROPERTIES rb{ D3D12_HEAP_TYPE_READBACK };
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1063,13 +1134,17 @@ namespace rt
         bool EnsureTlasBuffers(ID3D12Device5* device5, std::uint32_t instances, std::uint64_t frame)
         {
             if (instances <= g_tlas.capacity && g_tlas.result) return true;
+            const std::uint32_t requested = instances;  // 0.5.124: logged
             // 0.2.30: grow geometrically (x1.5, in 16384-instance steps). During a load the requested count rose 1024 at a
             // time, so the ~110 MB of TLAS buffers were reallocated several times a second while each old set stayed alive
             // for kGraveyardFrames: close to 1 GB in flight right before both load hangs (0.2.22, 0.2.29).
             {
                 // 0.5.5: first allocation is already 131072 instances (~60 MB), above the 98304 a Neon load asks for, so the
                 // TLAS buffers are no longer swapped in the middle of a load.
-                constexpr std::uint64_t kFirstTlasCapacity = 131072;
+                // 0.5.124: 262144 (about 120 MB). Both 0.5.122/0.5.123 Frame Generation hangs came 4-5 s after the TLAS
+                // buffers grew 131072 -> 196608 in play (one when a menu opened, one 11 s after a menu closed): the active
+                // count plus 25% headroom crossed 131072. Allocating enough up front keeps that swap out of play.
+                constexpr std::uint64_t kFirstTlasCapacity = 262144;
                 const std::uint64_t grown = (std::max<std::uint64_t>)((std::max<std::uint64_t>)(instances, std::uint64_t(g_tlas.capacity) * 3 / 2),
                     g_tlas.capacity ? 0 : kFirstTlasCapacity);
                 const std::uint64_t cap = (std::max<std::uint64_t>)(static_cast<std::uint64_t>((std::max)(g_settings.tlasMaxInstances, 1024)), instances);
@@ -1084,7 +1159,7 @@ namespace rt
             device5->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
             // 0.3.7: a reallocation soon after a load means the scene is still filling in: keep the effects paused a bit longer.
             if (frame < g_quietUntil.load() + 300) {
-                const std::uint64_t until = frame + 90;
+                const std::uint64_t until = frame + WaitFrames(90, 1.0f, 30);  // 0.5.103: was 90 frames
                 if (until > g_quietUntil.load()) g_quietUntil = until;
             }
             ComPtr<ID3D12Resource>* old[] = { &g_tlas.descs, &g_tlas.result, &g_tlas.scratch };
@@ -1102,8 +1177,9 @@ namespace rt
             g_tlas.capacity = instances;
             g_tlas.resultBytes = info.ResultDataMaxSizeInBytes;
             g_tlas.scratchBytes = info.ScratchDataSizeInBytes;
-            REX::INFO("Starfield RT: TLAS buffers for {} instances: result {:.1f} MB, scratch {:.1f} MB, descriptors {:.1f} MB", instances,
-                info.ResultDataMaxSizeInBytes / 1048576.0, info.ScratchDataSizeInBytes / 1048576.0, instances * 64 / 1048576.0);
+            REX::INFO("Starfield RT: TLAS buffers for {} instances: result {:.1f} MB, scratch {:.1f} MB, descriptors {:.1f} MB (asked for {}, "
+                      "{} active at the last count, frame {})", instances, info.ResultDataMaxSizeInBytes / 1048576.0,
+                info.ScratchDataSizeInBytes / 1048576.0, instances * 64 / 1048576.0, requested, g_tlas.activeCount, frame);
             return true;
         }
 
@@ -1131,6 +1207,10 @@ namespace rt
                 g_tlas.activeCount = g_tlas.counterMapped[slot][0];
                 g_tlas.glassCount = g_tlas.counterMapped[slot][1];  // 0.2.44
                 g_tlas.playerCount = g_tlas.counterMapped[slot][2];  // 0.2.67
+                g_tlas.sizeCulled = g_tlas.counterMapped[slot][3];   // 0.5.100
+                for (int b = 0; b < 11; ++b) g_tlas.breakdown[b] = g_tlas.counterMapped[slot][5 + b];  // 0.5.101
+                g_tlas.dupMesh = g_tlas.counterMapped[slot][16];   // 0.5.102
+                g_tlas.dupPlace = g_tlas.counterMapped[slot][17];
             }
             std::uint32_t limit = (std::min)(instances, 65536u);
             if (g_tlas.countFrames >= kRing) {
@@ -1168,7 +1248,7 @@ namespace rt
             const UINT vegCount = haveVeg ? static_cast<UINT>(veg.sizeBytes / 368) : 0;
             g_tlas.limit = limit;
             const float cull = perScene ? static_cast<float>((std::max)(g_settings.tlasCullDistance, 0)) : 0.0f;
-            UINT consts[13]{ instances, records, static_cast<UINT>(lods.sizeBytes / 20), meshCount, 0, materialCount,
+            UINT consts[16]{ instances, records, static_cast<UINT>(lods.sizeBytes / 20), meshCount, 0, materialCount,
                 (g_settings.alphaTest ? 1u : 0u) | (g_settings.glassSeparate ? 2u : 0u), vegCount, 0u, limit, 0u, 0u,
                 skinOn ? (std::min)(static_cast<UINT>((std::max)(g_settings.skinSlots, 0)), static_cast<UINT>(kSkinSlotsMax)) : 0u };
             std::memcpy(&consts[10], &cull, 4);
@@ -1183,7 +1263,21 @@ namespace rt
             }
             list4->SetComputeRootSignature(g_tlas.rootSig.Get());
             list4->SetPipelineState(g_tlas.pso.Get());
-            list4->SetComputeRoot32BitConstants(0, 13, consts, 0);
+            // 0.5.100: size-on-screen cull, tightened (with the range) while VRAM is nearly full.
+            const float pressure = VramPressureScale(device5, frame);
+            const float minAngle = perScene && g_settings.tlasMinAngle > 0.0f ? g_settings.tlasMinAngle / pressure : 0.0f;
+            std::memcpy(&consts[13], &minAngle, 4);
+            if (pressure < 1.0f) {
+                const float cullP = cull * pressure;
+                std::memcpy(&consts[10], &cullP, 4);
+            }
+            const D3D12_GPU_VIRTUAL_ADDRESS solidBits = GlassSolidBits();  // 0.5.126
+            consts[14] = solidBits ? 1u : 0u;
+            const D3D12_GPU_VIRTUAL_ADDRESS phantomBits = PhantomBits();  // 0.5.134
+            consts[15] = phantomBits ? 1u : 0u;
+            list4->SetComputeRoot32BitConstants(0, 16, consts, 0);
+            list4->SetComputeRootUnorderedAccessView(13, phantomBits ? phantomBits : g_tlas.counter->GetGPUVirtualAddress());  // never read when 0
+            list4->SetComputeRootUnorderedAccessView(12, solidBits ? solidBits : g_tlas.counter->GetGPUVirtualAddress());  // never read when 0
             list4->SetComputeRootConstantBufferView(9, perScene ? perScene : inst.gpuva);  // never read when cull is 0
             list4->SetComputeRootShaderResourceView(1, inst.gpuva);
             list4->SetComputeRootShaderResourceView(2, lods.gpuva);
@@ -1198,15 +1292,19 @@ namespace rt
             list4->SetComputeRootUnorderedAccessView(11, g_skin.ready ? g_skin.cands->GetGPUVirtualAddress() : g_tlas.counter->GetGPUVirtualAddress());
             D3D12_RESOURCE_BARRIER cuav{};
             cuav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            // Pass 0: reset the counter. Pass 1: pack active instances. Pass 2: null the tail up to the limit.
-            list4->Dispatch(1, 1, 1);
+            // Pass 0: reset the counter (0.5.102: and clear the duplicate hash tables). Pass 1: pack active instances.
+            // Pass 2: null the tail up to the limit.
+            rt::DredMark(list4, L"SFRT Blas tlas #5");
+            list4->Dispatch((2 * (1u << 19)) / 64, 1, 1);
             list4->ResourceBarrier(1, &cuav);
             consts[8] = 1;
             list4->SetComputeRoot32BitConstants(0, 1, &consts[8], 8);
+            rt::DredMark(list4, L"SFRT Blas tlas #6");
             list4->Dispatch((instances + 63) / 64, 1, 1);
             list4->ResourceBarrier(1, &cuav);
             consts[8] = 2;
             list4->SetComputeRoot32BitConstants(0, 1, &consts[8], 8);
+            rt::DredMark(list4, L"SFRT Blas tlas #7");
             list4->Dispatch((limit + 63) / 64, 1, 1);
             list4->ResourceBarrier(1, &cuav);
             // Copy this frame's active count for the CPU (read kRing frames later).
@@ -1215,7 +1313,35 @@ namespace rt
             ctr.Transition = { g_tlas.counter.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE };
             list4->ResourceBarrier(1, &ctr);
-            list4->CopyBufferRegion(g_tlas.counterReadback[slot].Get(), 0, g_tlas.counter.Get(), 0, 12);  // 0.2.44 glass, 0.2.67 player
+            list4->CopyBufferRegion(g_tlas.counterReadback[slot].Get(), 0, g_tlas.counter.Get(), 0, 64);  // 0.2.44 glass, 0.2.67 player, 0.5.100 size-culled, 0.5.101 breakdown
+            list4->CopyBufferRegion(g_tlas.counterReadback[slot].Get(), 64, g_tlas.counter.Get(), 4088, 8);  // 0.5.102 duplicates
+            if (g_nearDumpFrame && frame >= g_nearDumpFrame + kRing + 3 && g_nearDumpReadback) {  // 0.5.66
+                g_nearDumpFrame = 0;
+                void* m = nullptr;
+                const D3D12_RANGE rr{ 0, kCounterBytes };
+                if (SUCCEEDED(g_nearDumpReadback->Map(0, &rr, &m)) && m) {
+                    LogNearDump(static_cast<const std::uint32_t*>(m));
+                    const D3D12_RANGE none{ 0, 0 };
+                    g_nearDumpReadback->Unmap(0, &none);
+                }
+            }
+            if (!g_nearDumpFrame && g_nearDumpRequested.exchange(false)) {
+                if (!g_nearDumpReadback) {
+                    D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_READBACK };
+                    D3D12_RESOURCE_DESC bd{};
+                    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    bd.Width = kCounterBytes;
+                    bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+                    bd.SampleDesc.Count = 1;
+                    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    device5->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                        IID_PPV_ARGS(&g_nearDumpReadback));
+                }
+                if (g_nearDumpReadback) {
+                    list4->CopyBufferRegion(g_nearDumpReadback.Get(), 0, g_tlas.counter.Get(), 0, kCounterBytes);
+                    g_nearDumpFrame = (std::max)(frame, std::uint64_t(1));
+                }
+            }
             ctr.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             ctr.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             list4->ResourceBarrier(1, &ctr);
@@ -1246,6 +1372,7 @@ namespace rt
             build.Inputs.InstanceDescs = g_tlas.descs->GetGPUVirtualAddress();
             build.DestAccelerationStructureData = g_tlas.result->GetGPUVirtualAddress();
             build.ScratchAccelerationStructureData = g_tlas.scratch->GetGPUVirtualAddress();
+            rt::DredMark(list4, L"SFRT Blas AS build #8");
             list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
 
             D3D12_RESOURCE_BARRIER after[2]{};
@@ -1267,8 +1394,28 @@ namespace rt
 
     bool AlphaTestOn() { return g_settings.alphaTest; }
 
+    void RequestTableDump(std::uint32_t family, std::uint32_t material)
+    {
+        g_tableDumpReq = 0x80000000u | ((family & 0x1Fu) << 16) | (material & 0x7FFFu);
+    }
+
     bool SceneLoading() { return g_sceneLoading.load(); }
     bool SceneSettling() { return g_sceneLoading.load() || g_lastFrame.load() < g_quietUntil.load(); }
+
+    float RtFadeIn()
+    {
+        if (SceneSettling()) return 0.0f;
+        const long long end = g_settleEndNs.load();
+        if (end == 0) return 0.0f;
+        const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        return (std::clamp)(static_cast<float>(now - end) / ((std::max)(g_fadeSeconds, 0.01f) * 1e9f), 0.0f, 1.0f);
+    }
+
+    void SetLoadTiming(float settleSeconds, float fadeSeconds)
+    {
+        g_settleSeconds = (std::clamp)(settleSeconds, 0.0f, 3.0f);
+        g_fadeSeconds = (std::clamp)(fadeSeconds, 0.0f, 10.0f);
+    }
 
     bool ToggleGlassSeparate()
     {
@@ -1283,7 +1430,7 @@ namespace rt
         return g_settings.alphaTest;
     }
 
-    void RequestSkinDump() { g_skinDumpRequested = true; }
+    void RequestSkinDump() { g_skinDumpRequested = true; g_nearDumpRequested = true; }  // 0.5.66: + near-camera dump
 
     void SetBlasSettings(const BlasSettings& s)
     {
@@ -1314,6 +1461,39 @@ namespace rt
             g_lastMeshSize = meshes.sizeBytes;
         }
 
+        // 0.5.111: scene table dump for an unknown material family (requested by the crosshair probe).
+        if (const std::uint32_t req = g_tableDumpReq.exchange(0); req & 0x80000000u) {
+            const std::uint32_t family = (req >> 16) & 0x1Fu, material = req & 0x7FFFu;
+            REX::INFO("Starfield RT: [tables] family {} material {}: entry {} of every CPU-readable structured buffer in the scene table",
+                family, material, material);
+            for (std::uint32_t slot = 0; slot < 64; ++slot) {
+                BufferView v{};
+                if (!LookupGpuTableAny(table, slot, v)) continue;
+                if (v.cbv || !v.resource) {
+                    REX::INFO("Starfield RT: [tables]   +{}: {} ({} bytes)", slot, v.cbv ? "CBV" : "texture or null", v.sizeBytes);
+                    continue;
+                }
+                const std::uint32_t stride = v.stride ? v.stride : 0u;
+                std::string words;
+                bool mapped = false;
+                if (stride && std::uint64_t(material + 1) * stride <= v.sizeBytes) {
+                    void* m = nullptr;
+                    const std::uint64_t base = v.gpuva - v.resource->GetGPUVirtualAddress() + std::uint64_t(material) * stride;
+                    const std::uint32_t n = (std::min)(stride, 160u) / 4;
+                    const D3D12_RANGE rr{ static_cast<SIZE_T>(base), static_cast<SIZE_T>(base + n * 4) };
+                    if (SUCCEEDED(v.resource->Map(0, &rr, &m)) && m) {
+                        mapped = true;
+                        const auto* w = reinterpret_cast<const std::uint32_t*>(static_cast<const std::uint8_t*>(m) + base);
+                        for (std::uint32_t i = 0; i < n; ++i) words += std::format("{}{:08x}", i ? " " : "", w[i]);
+                        const D3D12_RANGE none{ 0, 0 };
+                        v.resource->Unmap(0, &none);
+                    }
+                }
+                REX::INFO("Starfield RT: [tables]   +{}: stride {}, {} bytes ({} entries){}{}", slot, stride, v.sizeBytes,
+                    stride ? v.sizeBytes / stride : 0, mapped ? ": " : (stride ? " (not CPU-readable or too small)" : " (raw)"), words);
+            }
+        }
+
         bool recorded = false;
         ComPtr<ID3D12Device5> device5;
         ComPtr<ID3D12GraphicsCommandList4> list4;
@@ -1337,6 +1517,28 @@ namespace rt
         // and the TLAS has not had to grow for 90 frames in a row (0.2.22 hung 0.4 s after resuming at 984 queued,
         // with the TLAS still growing every few frames).
         {
+            // 0.5.103: frame rate for the waits below, and how long RT effects were off after each load.
+            {
+                using clock = std::chrono::steady_clock;
+                static clock::time_point s_prev{};
+                const auto now = clock::now();
+                if (s_prev.time_since_epoch().count() != 0) {
+                    const float dt = std::chrono::duration<float>(now - s_prev).count();
+                    if (dt > 0.0f && dt < 0.5f) g_fps += (1.0f / dt - g_fps) * 0.05f;
+                }
+                s_prev = now;
+                static bool s_wasSettling = false;
+                static clock::time_point s_offSince{};
+                const bool settling = SceneSettling();
+                if (settling && !s_wasSettling) s_offSince = now;
+                if (settling) g_settleEndNs = 0;  // 0.5.104
+                else if (s_wasSettling || g_settleEndNs.load() == 0)
+                    g_settleEndNs = (std::max)(1ll, static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()));
+                if (!settling && s_wasSettling)
+                    REX::INFO("Starfield RT: RT effects back after {:.1f} s (loading and settling, {:.0f} fps rendered)",
+                        std::chrono::duration<float>(now - s_offSince).count(), g_fps);
+                s_wasSettling = settling;
+            }
             static std::uint64_t s_calmSince = 0;
             static std::uint32_t s_lastCapacity = 0;
             const bool busy = g_queue.size() > 1000 || g_scanStats.settling > 1000;
@@ -1345,11 +1547,11 @@ namespace rt
             if (!calm) s_calmSince = frame;
             bool loading = g_sceneLoading.load();
             if (busy) loading = true;
-            else if (loading && frame - s_calmSince >= 90) loading = false;
+            else if (loading && frame - s_calmSince >= WaitFrames(90, 1.0f, 30)) loading = false;  // 0.5.103: was 90 frames
             g_lastFrame = frame;
             if (loading != g_sceneLoading.exchange(loading)) {
                 ForgetReflectionInputs();  // 0.2.63: inputs remembered from before (or during) the load point at freed buffers
-                g_quietUntil = frame + 180;  // 0.3.7
+                g_quietUntil = frame + WaitFrames(180, g_settleSeconds, 45);  // 0.3.7: 180 frames; 0.5.103: at most 2 s (at least 45 frames); 0.5.106: ini
                 REX::INFO("Starfield RT: scene {} ({} BLAS builds queued, {} records settling): RT shadows {}", loading ? "loading" : "ready",
                     g_queue.size(), g_scanStats.settling, loading ? "paused" : "resumed");
             }
@@ -1374,10 +1576,13 @@ namespace rt
                 g_scanStats.used, g_scanStats.inPool, g_scanStats.outOfPool, g_settings.poolOnly ? "SKIPPED: bBlasPoolOnly=1" : "built",
                 g_scanStats.skinned, g_scanStats.tooBig, g_scanStats.settling, g_retainedStreamed);
             if (g_settings.tlasEnabled) {
-                REX::INFO("Starfield RT: TLAS: {} builds, {} active instances ({} glass{}, {} first-person player parts), {} descriptors built (capacity {}), result {:.1f} MB, gpuva {:#x}",
+                REX::INFO("Starfield RT: TLAS: {} builds, {} active instances ({} glass{}, {} first-person player parts; {} left out as too small on screen, VRAM range x{:.2f}), {} descriptors built (capacity {}), result {:.1f} MB, gpuva {:#x}",
                     g_tlas.builds, g_tlas.activeCount, g_tlas.glassCount, g_settings.glassSeparate ? ", skipped by reflection rays" : ", separation off",
-                    g_tlas.playerCount,
+                    g_tlas.playerCount, g_tlas.sizeCulled, g_vramScale,
                     g_tlas.lastInstances, g_tlas.capacity, g_tlas.resultBytes / 1048576.0, g_tlasAddress.load());
+                const auto& b = g_tlas.breakdown;
+                REX::INFO("Starfield RT: TLAS breakdown: distance <50 m {} | 50-200 {} | 200-1000 {} | 1000+ {}; radius <0.5 m {} | 0.5-2 {} | 2-10 {} | 10+ {}; alpha-tested {}, effect meshes {}, characters {}; duplicates: {} same mesh at the same place, {} sharing a place with another object",
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], g_tlas.dupMesh, g_tlas.dupPlace);
             }
         }
         return recorded;

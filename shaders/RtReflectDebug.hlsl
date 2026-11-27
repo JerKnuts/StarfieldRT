@@ -12,6 +12,8 @@
 
 RaytracingAccelerationStructure Scene   : register(t0, space1);
 static const uint kSolidMask = 0x01u;  // 0.2.44: instance mask of solid geometry (glass is 0x02)
+// 0.5.121: reflection, GI and glass reflection rays also see family 7 screens (0x08); shadow and camera rays don't.
+static const uint kReflectMask = 0x09u;
 Texture2D<float4>               GAlbedo : register(t0, space4);  // 0.2.27: albedo (sRGB view: reads linear)
 Texture2D<float4>               GNormal : register(t1, space4);
 Texture2D<float4>               GMat    : register(t2, space4);
@@ -94,6 +96,21 @@ cbuffer Params : register(b1)
                              //        bits 16..31 = emission scale (half float; 0 = material emission off)
 };
 
+// 0.5.71: view distance stored in PrevFrame for a reflection lookup. Pixels covered by smoke or glass are stored as
+// -(dist + 10): with Flags bit 12 (smoke in reflections) they are used, smoke included; otherwise they never match.
+float PrevDistance(uint bits)
+{
+    const float d = asfloat(bits);
+    return ((Flags & 4096u) && d < -5.0f) ? -d - 10.0f : d;
+}
+
+// 0.5.104: fade-in after a load. Flags bits 24..31 = how far RT has faded in (0 = the game's image, 255 = full RT).
+// Reflections, GI and thin glass blend from the game's result to RT over about 0.75 s instead of popping on.
+float RtFade()
+{
+    return float(Flags >> 24) / 255.0f;
+}
+
 static const uint kBindlessBase = 32768;
 // 0.3.7: material records can be half-written right after a load; a texture index past the descriptor heap (98304
 // entries in this game) is undefined behaviour on the GPU, so such indices are treated as "no texture".
@@ -141,7 +158,39 @@ static const float kCharSelfGap = 0.2f;
 // game's level-of-detail switch the drawn wall is a simpler mesh than our RT copy, the ray started inside our copy and
 // hit its inner face, so lamps lit posters only inside a circle around the camera.
 static const float kLampCoverGap = 0.1f;
-float LampShadowHit(float3 origin, float3 dir, float range, float viewDist, out uint hitInst)
+float3 GeometricNormal(uint instance, uint prim, float3x4 o2w, float3 dir);  // defined with the glass pass
+
+// 0.5.78: surfN = the shaded surface's normal. A FRONT-face hit within the self-gap that lies parallel to it is the
+// surface's own full-detail copy (past the game's LOD switch): passed, as reflections do since 0.5.76. Ryujin lobby probe:
+// a wall 14.8 m away had two lamps blocked at 0.14-0.16 m, so the wall went dark beyond a circle around the camera.
+// 0.5.80: the object drawn at a pixel (camera ray to posRel, camera-relative), for self-hit tests. 0xFFFFFFFF = none.
+uint PixelInstance(float3 posRel)
+{
+    const float d = length(posRel);
+    RayDesc cr;
+    cr.Origin = PerSceneRows[0].xyz;
+    cr.Direction = posRel / max(d, 1e-4f);
+    cr.TMin = 0.0f;
+    cr.TMax = d * 1.05f + 0.5f;
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> cq;
+    cq.TraceRayInline(Scene, RAY_FLAG_NONE, kSolidMask, cr);
+    uint c = 0;
+    while (cq.Proceed())
+    {
+        if (cq.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+        {
+            if (++c > 64) cq.Abort();
+            else if (cq.CandidateInstanceContributionToHitGroupIndex() != 1u) cq.CommitNonOpaqueTriangleHit();
+        }
+    }
+    return cq.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? cq.CommittedInstanceID() : 0xFFFFFFFFu;
+}
+
+// 0.5.80: selfInst = the object drawn at the pixel (0xFFFFFFFE = not looked up yet; found lazily with a camera ray, only
+// when a hit lands inside the self-gap). A hit inside the gap on that same object is passed too, whatever way it faces:
+// a poster 10 m away had its lamps blocked at 0.13 m by its own frame (Ryujin lobby probe), which isn't parallel to it.
+float LampShadowHit(float3 origin, float3 dir, float range, float viewDist, float3 surfN, float3 posRel, inout uint selfInst,
+                    out uint hitInst)
 {
     hitInst = 0xFFFFFFFFu;
     const float selfGap = 0.1f + viewDist * 0.02f;
@@ -151,7 +200,9 @@ float LampShadowHit(float3 origin, float3 dir, float range, float viewDist, out 
     sray.TMin = 0.0f;
     sray.TMax = range;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> sq;
-    [loop] for (uint tries = 0; tries < 3; ++tries)
+    // 0.5.82: up to 8 tries (was 3): a poster is several layers of one object (cover, frame, backing), and after two
+    // skips the third self-hit still counted as a shadow (probe: blocked at 0.20 m by the poster itself, 13 m away).
+    [loop] for (uint tries = 0; tries < 8; ++tries)
     {
         sq.TraceRayInline(Scene, RAY_FLAG_NONE, kSolidMask, sray);
         PROCEED_ALPHA(sq)
@@ -159,8 +210,16 @@ float LampShadowHit(float3 origin, float3 dir, float range, float viewDist, out 
             return -1.0f;
         const float t = sq.CommittedRayT();
         hitInst = sq.CommittedInstanceID();
-        const bool skip = t <= kLampCoverGap || (!sq.CommittedTriangleFrontFace() && t < selfGap);
-        if (!skip || tries == 2)
+        bool skip = t <= kLampCoverGap || (!sq.CommittedTriangleFrontFace() && t < selfGap);
+        if (!skip && t < selfGap)
+            skip = abs(dot(GeometricNormal(hitInst, sq.CommittedPrimitiveIndex(), sq.CommittedObjectToWorld3x4(), dir), surfN)) > 0.8f;
+        if (!skip && t < selfGap)
+        {
+            if (selfInst == 0xFFFFFFFEu)
+                selfInst = PixelInstance(posRel);
+            skip = hitInst == selfInst;
+        }
+        if (!skip || tries == 7)
             return t;
         sray.TMin = t + 0.02f;
         if (sray.TMin >= range)
@@ -309,7 +368,8 @@ float3 HitAlbedo(uint instance, uint meshB, uint3 idx, float2 bary, float coneWi
                 }
                 const float lum = asfloat(Materials.Load(b + 0)), ev = asfloat(Materials.Load(b + 4));
                 const float strength = (LocalShadowMax & 0x100u)
-                    ? max(lum, 0.0f)                                           // luminous emittance, absolute
+                    ? max(lum, 0.0f) * 0.0795775f                             // 0.5.122: luminous emittance / 4 pi (radiance; a probe:
+                                                                               // lum 95.5 -> 7.6, the game showed 7.75)
                     : exp2(clamp(ev, -16.0f, 16.0f)) * invExposure;            // adaptive: fixed brightness on screen
                 emission = tint * em * strength * emScale;
                 if (!all(isfinite(emission))) emission = 0.0f;
@@ -464,6 +524,9 @@ float3 LocalLights(float3 pw, float3 nw)
     return sum * LocalLightScale;
 }
 
+// 0.5.125: the parts of the last ShadeHit result (per thread), for the glass probe ring: albedo, emission, the game's
+// lamps, and ambient + sun. All in the same units as the result.
+static float3 g_shAlbedo = 0.0f, g_shEmission = 0.0f, g_shLamps = 0.0f, g_shOther = 0.0f;
 float3 ShadeHit(float3 origin, float3 r, float t, uint instance, uint prim, float2 bary, float3x4 o2w, float3 ambient,
                 float sunScale, float2 cone)
 {
@@ -512,7 +575,12 @@ float3 ShadeHit(float3 origin, float3 r, float t, uint instance, uint prim, floa
                 light += SunIntensity * sunScale * ndl;
         }
     }
-    light += LocalLights(origin + r * t, hn);  // 0.2.58
+    const float3 lamps = LocalLights(origin + r * t, hn);  // 0.2.58
+    g_shAlbedo = albedo;
+    g_shEmission = emission;
+    g_shLamps = albedo * lamps;
+    g_shOther = albedo * light;
+    light += lamps;
     return albedo * light + emission;  // 0.3.6: + the material's own light
 }
 
@@ -546,6 +614,24 @@ float3 SampleGgxReflection(float3 n, float3 v, float alpha, float2 u)
     return dot(l, n) > 1e-3f ? l : reflect(-v, n);
 }
 
+// 0.5.108: roughness and metalness for lighting. G-buffer types 1 and 8 (skin and hair) take their roughness from a
+// material table the game's lighting shader indexes with t5.z (RT_FINDINGS "Indirect"); their t2.y is not a roughness
+// (near 0 on NPC hair: mirror-sharp, very bright RT lamp highlights, the soak test's "NPC hair very shiny"). We don't
+// bind that table, so they get a soft dielectric: roughness 0.5, metalness 0.
+static const float kTableMaterialRough = 0.5f;
+bool TableMaterial(uint2 g)
+{
+    const uint type = GType[g] & 15u;
+    return type == 1u || type == 8u;
+}
+void GameRoughMetal(uint2 g, out float rough, out float metal)
+{
+    const float4 mat = GMat[g];
+    const bool table = TableMaterial(g);
+    rough = table ? kTableMaterialRough : saturate(mat.y);
+    metal = table ? 0.0f : saturate(mat.z);
+}
+
 uint PackNormal(float3 n)
 {
     const uint3 q = uint3(saturate(n * 0.5f + 0.5f) * 1023.0f + 0.5f);
@@ -565,6 +651,7 @@ struct Surface
     float3 n, view, game, w, probe;
     float  rough, k, e, viewDist, ao, ndv;
     float3 posRel;
+    float  metal;      // 0.5.128: G-buffer metalness (for the probe floor on off-screen hits)
 };
 
 void DumpLamps(uint dl, float3 posRel, float3 n, uint pixelChannels, float viewDist);  // 0.5.40, defined after DlAtten
@@ -583,6 +670,7 @@ Surface LoadSurface(uint2 p, uint addr)
     sf.n = DecodeNormalWorld(GNormal[g].xy);
     const float4 mat = GMat[g];
     sf.rough = saturate(mat.y);
+    sf.metal = saturate(mat.z);  // 0.5.128
     sf.ao = saturate(mat.x);
     const uint type = GType[g] & 15u;
     if ((SmoothTypes >> type) & 1u)
@@ -628,6 +716,8 @@ Surface LoadSurface(uint2 p, uint addr)
     sf.k *= ramp;
     sf.e = Exposure();
     sf.probe = sf.game / (sf.w * sf.e);
+    if (Flags & 8192u)
+        sf.w = 1.0f.xxx;  // 0.5.72: reflection source view: full weight so the source colours show
     sf.valid = true;
     return sf;
 }
@@ -645,14 +735,92 @@ uint2 TraceSize()
     return (Size + TraceScale - 1) / TraceScale;
 }
 
+// 0.5.92: the traced pixel inside a trace cell for a frame. 2x2: the 4 pixels in turn; 4x4 (Medium/Low GI): the 16 in
+// a Bayer order so any 4 frames in a row spread across the cell.
+uint2 TraceJitter(uint frame)
+{
+    if (TraceScale <= 1) return uint2(0, 0);
+    if (TraceScale == 2) { const uint f = frame & 3u; return uint2(f & 1u, f >> 1); }
+    static const uint kBayer[16] = { 0, 10, 2, 8, 5, 15, 7, 13, 1, 11, 3, 9, 4, 14, 6, 12 };
+    const uint b = kBayer[frame & 15u];
+    return min(uint2(b & 3u, b >> 2), (TraceScale - 1).xx);
+}
+
+// 0.5.75: per-object shading correction (after the reflection-ray dump: Size.x * Size.y * 48 + 1280, 16 B per instance
+// record: RGB = the game's on-screen colour / our shading of the same point, A = 1 once learned). Our shading of a hit
+// (sun, the game's lamps, ambient, glow) is duller than the game's lit image; hits that were on screen take the image's
+// colour, so reflections switched from bright to dull at the edge of the screen's reach: a circle that moved with the
+// camera. On-screen hits teach each object its correction; off-screen hits use it, so both sides match.
+static const uint kShadeCacheCap = 1u << 19;
+uint ShadeCacheAddr(uint inst) { return Size.x * Size.y * 48u + 1280u + inst * 16u; }
+
+// 0.5.109: glow memory. Video screens (material family 7) read black in the G-buffer, so our shading of an off-screen hit
+// on one is black: no screen in reflections or GI once it leaves the view. On-screen hits now also learn each object's
+// glow: the part of its on-screen colour that our shading can't explain even with the largest correction (x8). Off-screen
+// hits add it back. Entry: rgb glow (image / exposure), w = the object's LOD material dword (a reused record slot holding
+// another object doesn't inherit the glow).
+// 0.5.110: which trace cells learn the correction / glow this frame: whole 8x8 blocks (one thread group), 1 block in 16,
+// rotating. 0.5.75-0.5.109 picked 1 cell in 16 inside every block, so every group waited for its few learners (GI went
+// from about 3 to 4-7.5 ms with the 0.5.109 glow learning).
+bool LearnThisFrame(uint2 q)
+{
+    const uint2 b = q >> 3;
+    return ((b.x + b.y * 5u) & 15u) == (Frame & 15u);
+}
+// 0.5.116: family 7 screens play their video by switching material every frame (the 0.5.115 glass ring: instance 3398,
+// materials 372, 408, 358, 434, ...), so for them the tag leaves the material bits (13+) out, or the entry never matched.
+// 0.5.117: ...and every video frame is a separate instance record too (probes: instances 2977, 3111, 3072, 3146, same mesh
+// 9049, same place). For family 7 the entry is keyed by the instance's world position (0.5 m cells) instead of its index,
+// so all frames of one screen share one entry.
+uint GlowPosHash(uint inst)
+{
+    const int3 c = int3(floor(asfloat(Instances.Load3(inst * 96u + 32u)) * 2.0f));
+    uint h = asuint(c.x) * 73856093u ^ asuint(c.y) * 19349663u ^ asuint(c.z) * 83492791u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return h;
+}
+bool GlowByPlace(uint inst) { return (Lods.Load(inst * 80u) & 0x1Fu) == 7u; }
+uint GlowSlot(uint inst) { return GlowByPlace(inst) ? (GlowPosHash(inst) & (kShadeCacheCap - 1u)) : inst; }
+uint GlowTag(uint inst)
+{
+    const uint lod = Lods.Load(inst * 80u);
+    return ((lod & 0x1Fu) == 7u ? (GlowPosHash(inst) | 0x40000000u) : lod) | 0x80000000u;
+}
+void LearnGlow(uint addr, uint inst, float3 radiance, float3 ours, float k)
+{
+    const uint tag = GlowTag(inst);
+    // 0.5.112: families whose materials we can't read (not 0 standard, not 3 vegetation) are shaded as a grey placeholder,
+    // so "8x our shading" could out-shine a bright screen (a family 12 screen at HDR 2.9 / 1.0 / 3.4 never learned a glow).
+    // For them the glow is simply what our shading misses.
+    const uint family = Lods.Load(inst * 80u) & 0x1Fu;  // 0.5.117: from the record (the tag may be a position key)
+    const float maxCorr = (family == 0u || family == 3u) ? 8.0f : 1.0f;
+    const float3 g = max(radiance - maxCorr * max(ours, 0.0f) - k, 0.0f);
+    const uint4 old = Rad.Load4(addr);
+    float3 nu;
+    if (old.w == tag && all(isfinite(asfloat(old.xyz))))
+        nu = lerp(asfloat(old.xyz), g, 0.1f);
+    else if (any(g > 0.0f))
+        nu = g;
+    else
+        return;
+    if (all(isfinite(nu)))
+        Rad.Store4(addr, uint4(asuint(nu), tag));
+}
+float3 GlowOf(uint addr, uint inst)
+{
+    const uint4 v = Rad.Load4(addr);
+    const float3 g = asfloat(v.xyz);
+    return (v.w == GlowTag(inst) && all(isfinite(g))) ? max(g, 0.0f) : 0.0f;
+}
+uint ReflGlowAddr(uint inst) { return ShadeCacheAddr(kShadeCacheCap) + GlowSlot(inst) * 16u; }  // after the correction cache
+
 void TraceGlossy(uint2 q)
 {
     const uint2 ts = TraceSize();
     if (q.x >= ts.x || q.y >= ts.y)
         return;
     const uint radAddr = (q.y * ts.x + q.x) * 16;
-    const uint f = Frame & 3u;
-    const uint2 jitter = TraceScale > 1 ? uint2(f & 1u, f >> 1) : uint2(0, 0);
+    const uint2 jitter = TraceJitter(Frame);  // 0.5.92
     const uint2 p = min(q * TraceScale + jitter, Size - 1);
     const uint addr = p.y * PitchBytes + p.x * 4;
     const Surface sf = LoadSurface(p, addr);
@@ -673,21 +841,35 @@ void TraceGlossy(uint2 q)
     // 0.5.33: skip self-hits. Past the game's level-of-detail switch the drawn surface is a simpler mesh than our RT copy,
     // centimetres apart on curved shapes, so the ray started inside our copy and hit its inner face: copper columns
     // reflected copper (deep red) beyond a circle around the camera. A back-face hit close to the start is passed through.
+    // 0.5.76: ...and a FRONT-face hit close to the start that lies parallel to the surface (its own copy, in front of the
+    // game's simpler distant model). Ryujin lobby probe: a wall 12 m away reflected itself (hit at 0.01 m, same object),
+    // so beyond that distance the wall showed no reflection: the "circle" that grew as you walked in. Objects standing
+    // on the surface face another way and still reflect.
     const float selfGap = 0.1f + sf.viewDist * 0.02f;
-    [loop] for (uint tries = 0; tries < 3; ++tries)
+    [loop] for (uint tries = 0; tries < 4; ++tries)
     {
-        rq.TraceRayInline(Scene, RAY_FLAG_NONE, kSolidMask, ray);
+        rq.TraceRayInline(Scene, RAY_FLAG_NONE, kReflectMask, ray);  // 0.5.121
         PROCEED_ALPHA_NOPLAYER(rq)
-        if (tries < 2 && rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT && !rq.CommittedTriangleFrontFace() &&
-            rq.CommittedRayT() < selfGap)
+        if (tries < 3 && rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT && rq.CommittedRayT() < selfGap)
         {
-            ray.TMin = rq.CommittedRayT() + 0.01f;
-            continue;
+            bool skip = !rq.CommittedTriangleFrontFace();
+            if (!skip)
+            {
+                const float3 hn = GeometricNormal(rq.CommittedInstanceID(), rq.CommittedPrimitiveIndex(),
+                                                  rq.CommittedObjectToWorld3x4(), r);
+                skip = abs(dot(hn, sf.n)) > 0.8f;
+            }
+            if (skip)
+            {
+                ray.TMin = rq.CommittedRayT() + 0.01f;
+                continue;
+            }
         }
         break;
     }
     float3 radiance = sf.probe;  // miss: what the game's probe sees in that direction
     bool onScreen = false;
+    uint lookup = 0u;  // 0.5.73 (source view): 1 = off screen, 2 = on screen but unusable there, 3 = distance mismatch
     if (rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT && (Flags & 320u) == 320u)
     {
         // 0.4.4: a hit that was visible last frame takes its real lit colour from last frame's image (the GI capture),
@@ -697,6 +879,7 @@ void TraceGlossy(uint2 q)
         const float3 pr = ray.Origin + r * rq.CommittedRayT() - asfloat(Rad.Load3(prev));
         const float4 clip = pr.x * asfloat(Rad.Load4(prev + 80)) + pr.y * asfloat(Rad.Load4(prev + 96)) +
                             pr.z * asfloat(Rad.Load4(prev + 112)) + asfloat(Rad.Load4(prev + 128));
+        lookup = 1u;
         if (clip.w > 1e-4f)
         {
             const float2 uvp = float2(clip.x / clip.w * 0.5f + 0.5f, 0.5f - clip.y / clip.w * 0.5f);
@@ -705,11 +888,47 @@ void TraceGlossy(uint2 q)
                 const uint2 pp = min(uint2(uvp * float2(Size)), Size - 1);
                 const uint2 d = PrevFrame.Load2((pp.y * Size.x + pp.x) * 8);
                 const float expect = length(pr);
-                if (abs(asfloat(d.y) - expect) < 0.03f * expect + 0.1f)
+                lookup = PrevDistance(d.y) < 0.0f ? 2u : 3u;
+                if (abs(PrevDistance(d.y) - expect) < 0.03f * expect + 0.1f)
                 {
                     radiance = UnpackR11G11B10(d.x) / max(sf.e, 1e-6f);
+                    // 0.5.75: learn this object's correction on 1 pixel in 16 per frame (rotating), and not from smoke-
+                    // covered pixels (their colour is the smoke's, not the object's).
+                    const uint inst = rq.CommittedInstanceID();
+                    if (inst < kShadeCacheCap && asfloat(d.y) > 0.0f && LearnThisFrame(q))
+                    {
+                        const float pix = PixelAngle() * float(TraceScale);
+                        const float3 ours = ShadeHit(ray.Origin, r, rq.CommittedRayT(), inst, rq.CommittedPrimitiveIndex(),
+                            rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), sf.probe * ProbeAmbient,
+                            1.0f / max(sf.e, 1e-6f), float2(sf.viewDist * pix, pix + 0.25f * alpha));
+                        const float k = 0.02f / max(sf.e, 1e-6f);  // keeps the ratio sane on very dark points
+                        const float3 ratio = clamp((radiance + k) / (max(ours, 0.0f) + k), 0.25f, 8.0f);
+                        LearnGlow(ReflGlowAddr(inst), inst, radiance, ours, k);  // 0.5.109
+                        if (all(isfinite(ratio)))
+                        {
+                            const uint ca = ShadeCacheAddr(inst);
+                            const float4 old = asfloat(Rad.Load4(ca));
+                            const float4 nu = (old.w > 0.5f && all(isfinite(old))) ? float4(lerp(old.rgb, ratio, 0.1f), 1.0f) : float4(ratio, 1.0f);
+                            Rad.Store4(ca, asuint(nu));
+                        }
+                    }
                     radiance *= SpecularOcclusion(sf.ndv, sf.ao, sf.rough);
                     onScreen = true;
+                }
+                // 0.5.118: family 7 screens draw their picture as a transparent layer over a black panel, so their pixels
+                // are marked covered (-(dist + 10)) and never taught the glow. For them, a covered pixel at the right
+                // distance teaches it (the colour is the picture, which is what should light the room).
+                if (asfloat(d.y) < -5.0f && abs(-asfloat(d.y) - 10.0f - expect) < 0.03f * expect + 0.1f)
+                {
+                    const uint inst = rq.CommittedInstanceID();
+                    if (inst < kShadeCacheCap && GlowByPlace(inst) && LearnThisFrame(q))
+                    {
+                        const float pix = PixelAngle() * float(TraceScale);
+                        const float3 ours = ShadeHit(ray.Origin, r, rq.CommittedRayT(), inst, rq.CommittedPrimitiveIndex(),
+                            rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), sf.probe * ProbeAmbient,
+                            1.0f / max(sf.e, 1e-6f), float2(sf.viewDist * pix, pix + 0.25f * alpha));
+                        LearnGlow(ReflGlowAddr(inst), inst, UnpackR11G11B10(d.x) / max(sf.e, 1e-6f), ours, 0.02f / max(sf.e, 1e-6f));
+                    }
                 }
             }
         }
@@ -723,13 +942,64 @@ void TraceGlossy(uint2 q)
         radiance = ShadeHit(ray.Origin, r, rq.CommittedRayT(), rq.CommittedInstanceID(), rq.CommittedPrimitiveIndex(),
             rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), sf.probe * ProbeAmbient, 1.0f / max(sf.e, 1e-6f),
             float2(sf.viewDist * pix, pix + 0.25f * alpha));
+        if ((Flags & 16384u) && rq.CommittedInstanceID() < kShadeCacheCap)  // 0.5.75: the object's learned correction
+        {
+            const float4 corr = asfloat(Rad.Load4(ShadeCacheAddr(rq.CommittedInstanceID())));
+            if (corr.w > 0.5f && all(isfinite(corr)))
+                radiance *= clamp(corr.rgb, 0.25f, 8.0f);
+            radiance += GlowOf(ReflGlowAddr(rq.CommittedInstanceID()), rq.CommittedInstanceID());  // 0.5.109
+        }
         // 0.5.32: an off-screen hit is lit only by the sun, the game's lamps and a weak ambient term, while the game's
         // probe saw that direction fully lit (bounce light, emissives). Metals show nothing but their reflection, so they
         // went near-black (copper columns, The Viewport's facade) and the dark samples smeared across frames. Never darker
         // than the probe: RT keeps lamp highlights and sunlit hits, the probe fills the rest. Flags bit 10 (Ctrl+Numpad 5).
+        // 0.5.128: metals only. On a glossy dielectric (the Jemison sign boxes, metalness 0) the floor pasted the game's
+        // cubemap over the real reflection wherever our shading was darker in any channel: a dark red wall behind the
+        // player (0.48, 0.06, 0.07) came out as the cubemap's grey (0.54, 0.62, 0.52). Metals keep it, scaled by
+        // metalness, since they show nothing but their reflection.
         if (Flags & 1024u)
-            radiance = max(radiance, sf.probe);
+            radiance = max(radiance, sf.probe * saturate((sf.metal - 0.3f) / 0.4f));
         radiance *= SpecularOcclusion(sf.ndv, sf.ao, sf.rough);  // 0.2.29: was the plain AO
+    }
+    // 0.5.74: Numpad . dump of the crosshair pixel's reflection ray (after the image region: Size.x * Size.y * 48 + 1024):
+    // what it hit, where its colour came from, and our own shading of that hit next to it (both x exposure = HDR).
+    if ((Flags & 32u) && all(q == (Size / 2) / TraceScale))
+    {
+        const uint db = Size.x * Size.y * 48u + 1024u;
+        const bool hit = rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+        float3 rtRad = 0.0f;
+        if (hit)
+        {
+            const float pix = PixelAngle() * float(TraceScale);
+            rtRad = ShadeHit(ray.Origin, r, rq.CommittedRayT(), rq.CommittedInstanceID(), rq.CommittedPrimitiveIndex(),
+                rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), sf.probe * ProbeAmbient, 1.0f / max(sf.e, 1e-6f),
+                float2(sf.viewDist * pix, pix + 0.25f * alpha));
+        }
+        Rad.Store4(db, uint4(0x444C4652u, hit ? 1u : 0u, hit ? rq.CommittedInstanceID() : 0xFFFFFFFFu, asuint(hit ? rq.CommittedRayT() : -1.0f)));
+        Rad.Store4(db + 16, uint4(hit ? Lods.Load(rq.CommittedInstanceID() * 80) : 0u, lookup, onScreen ? 1u : 0u, asuint(sf.viewDist)));
+        Rad.Store3(db + 32, asuint(radiance * sf.e));
+        Rad.Store3(db + 48, asuint(rtRad * sf.e));
+        Rad.Store3(db + 64, asuint(sf.probe * sf.e));
+        Rad.Store3(db + 80, asuint(r));
+        Rad.Store3(db + 96, asuint(sf.w));
+        Rad.Store(db + 108, asuint(sf.rough));
+    }
+    // 0.5.72: reflection source view (Alt+Numpad 0): green = colour from last frame's image (on-screen hit), blue = no
+    // hit (the game's probe). 0.5.73 splits the ray-traced case by reason: red = the hit was off screen last frame,
+    // yellow = on screen but the distance there didn't match (another surface in front, or our full-detail copy vs the
+    // game's simpler distant model), white = on screen but marked unusable (smoke, glass, metal), magenta = the ray hit
+    // something within 50 cm + 3% of the view distance of its start (likely the surface's own copy).
+    if (Flags & 8192u)
+    {
+        const bool hit = rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+        float3 src = float3(0.0f, 0.0f, 0.6f);
+        if (hit && rq.CommittedRayT() < 0.5f + 0.03f * sf.viewDist)
+            src = float3(0.6f, 0.0f, 0.6f);  // 0.5.76: checked first (a self-hit lands on its own on-screen pixel)
+        else if (onScreen)
+            src = float3(0.0f, 0.6f, 0.0f);
+        else if (hit)
+            src = lookup == 3u ? float3(0.6f, 0.6f, 0.0f) : lookup == 2u ? float3(0.6f, 0.6f, 0.6f) : float3(0.6f, 0.0f, 0.0f);
+        radiance = src / max(sf.e, 1e-6f);
     }
     radiance = min(radiance, 16.0f / max(sf.e, 1e-6f));  // firefly guard (0.4.3: 16x the exposure's white, was 64x)
     Rad.Store4(radAddr, uint4(f32tof16(radiance.r) | (f32tof16(radiance.g) << 16), f32tof16(radiance.b) | (f32tof16(sf.rough) << 16),
@@ -797,7 +1067,7 @@ void Resolve(uint3 tid : SV_DispatchThreadID)
         cr.TMin = 0.5f;
         cr.TMax = 1.0e5f;
         RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> cq;
-        cq.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFBu, cr);
+        cq.TraceRayInline(Scene, RAY_FLAG_NONE, 0xEBu, cr);
         cq.Proceed();
         Rad.Store(d + 96, 0xFFFFFFFFu);
         if (cq.CommittedStatus() == COMMITTED_TRIANGLE_HIT && MaterialCount != 0)
@@ -822,7 +1092,8 @@ void Resolve(uint3 tid : SV_DispatchThreadID)
     }
     if (!sf.valid)
     {
-        Out.Store(addr, sf.keepGame ? GameSpec.Load(addr) : 0u);  // not traced: the game's value, or none (0.2.31)
+        // not traced: the game's value, or none (0.2.31); 0.5.104: the game's value fades out with the fade-in
+        Out.Store(addr, sf.keepGame ? GameSpec.Load(addr) : PackR11G11B10(UnpackR11G11B10(GameSpec.Load(addr)) * (1.0f - RtFade())));
         return;
     }
     // 0.2.34: joint upsample + filter. Samples live on the trace grid; each is weighted against THIS pixel's own
@@ -858,7 +1129,7 @@ void Resolve(uint3 tid : SV_DispatchThreadID)
     }
     const float3 Lf = wsum > 0.0f ? sum / wsum : sf.probe;
     const float3 rt = sf.w * Lf * sf.e * Scale;
-    Out.Store(addr, PackR11G11B10(lerp(sf.game, rt, sf.k)));
+    Out.Store(addr, PackR11G11B10(lerp(sf.game, rt, sf.k * RtFade())));  // 0.5.104: x fade-in
 }
 
 [numthreads(8, 8, 1)]
@@ -1003,28 +1274,87 @@ float3 GeometricNormal(uint instance, uint prim, float3x4 o2w, float3 dir)
     return dot(n, dir) > 0.0f ? -n : n;  // face the camera
 }
 
+// 0.5.61: smoke-proof thin glass. Until now the reflection was switched (and faded) per pixel by the game's transparency
+// coverage b0, which drifting smoke changes every frame. Two things went wrong under smoke:
+//   - objects tagged as see-through that the game never draws as glass (light beams, glow cards, other additive or
+//     hidden meshes) got a mirror reflection exactly where smoke drifted over them, and lost it when it moved on;
+//   - real glass with a faint coverage of its own got a strength that followed the smoke density.
+// Now every tagged object earns a score: the share of its pixels where the game draws something see-through, sampled
+// on a rotating 1-in-16 pixel pattern whether or not anything is drawn there (so the sample is unbiased), and averaged
+// over frames by GlassScore (slow up, fast down). Real glass is always covered: score ~1. A mesh only revealed by smoke
+// is covered only where the smoke is: low score, no reflection. The strength then depends on the object's score, not
+// on the smoke over each pixel, so it cannot flicker with it.
+// Stats live in Out after the image (Out = the glass buffer): GlassStatsBase + 8 i = (samples, covered) for record i,
+// GlassStatsBase + 8 cap + 4 i = score (float). cap = GlassStatCap. Flags bit 10 = score gate off (0.5.60 behaviour).
+#define GlassStatsBase asuint(FadeStart)
+#define GlassStatCap   asuint(FadeEnd)
+// 0.5.70: after the scores: this frame's glass reflection per pixel (8 B: R11G11B10 contribution, f32 glass distance,
+// 0 = no glass), blurred and added by GlassComposite; then the camera rows (PerScene 0..16) of the frame whose image the
+// GI capture holds, for the on-screen lookup (Flags bit 11).
+// 0.5.96: then per record (standoff samples, samples clearly off the surface behind) at GlassStatsBase + 12 cap + 8 i and
+// the standoff score at GlassStatsBase + 20 cap + 4 i (see GlassStandoff).
+#define GlassStandBase      (GlassStatsBase + GlassStatCap * 12u)
+#define GlassStandScoreBase (GlassStatsBase + GlassStatCap * 20u)
+#define GlassReflBase  (GlassStatsBase + GlassStatCap * 24u)
+#define GlassCamBase   (GlassReflBase + Size.x * Size.y * 8u)
+// 0.5.98: 64-frame ring of what the glass pass decided at the screen-centre pixel (32 B per frame), read back by the
+// Numpad . probe: frame, stage | bits, instance, glass distance, candidates (first | fallback << 16), standoff weight,
+// final weight, reflection HDR luminance.
+#define GlassRingBase  (GlassCamBase + 512u)
+
+float GlassScore(uint inst)
+{
+    if (inst >= GlassStatCap)
+        return 1.0f;  // not tracked: trust the tag
+    const float s = asfloat(Out.Load(GlassStatsBase + GlassStatCap * 8u + inst * 4u));
+    return (s >= 0.0f && s <= 1.0f) ? s : 0.0f;  // also catches NaN
+}
+
+// Max of the 2x2 half-res b0 texels around the pixel: the half-res mask is blocky, and a pane's edge pixels would
+// otherwise read the texel next to the pane and count as uncovered.
+float CoverageAt(uint2 p)
+{
+    Texture2D<float> moments = ResourceDescriptorHeap[GlassMomentIndex];
+    uint2 ms;
+    moments.GetDimensions(ms.x, ms.y);
+    const float2 f = (float2(p) + 0.5f) * float2(ms) / float2(Size) - 0.5f;
+    const int2 a = clamp(int2(floor(f)), int2(0, 0), int2(ms) - 1);
+    const int2 b = min(a + 1, int2(ms) - 1);
+    return max(max(moments.Load(int3(a, 0)), moments.Load(int3(b.x, a.y, 0))),
+               max(moments.Load(int3(a.x, b.y, 0)), moments.Load(int3(b, 0))));
+}
+
 [numthreads(8, 8, 1)]
 void Glass(uint3 tid : SV_DispatchThreadID)
 {
     const uint2 p = tid.xy;
     if (p.x >= Size.x || p.y >= Size.y)
         return;
-    // 0.2.55: the coverage gate is off by default (GlassMinCoverage < 0): every see-through instance the camera ray finds
-    // gets a reflection. Flags bit 8 = stage debug view (see the end of this function).
+    // Flags bit 8 = stage debug view (see the debug colours below).
     const bool debugView = (Flags & 8u) != 0;
-    Texture2D<float> moments = ResourceDescriptorHeap[GlassMomentIndex];
-    uint2 ms;
-    moments.GetDimensions(ms.x, ms.y);
-    const uint2 mp = min(p * ms / Size, ms - 1);
-    const float b0 = moments.Load(int3(mp, 0));
-    const bool covered = b0 > max(GlassMinCoverage, 0.0f);
-    // 0.4.10: fade the reflection in with the coverage (full from about 0.02 above the threshold) instead of switching it
-    // on at the threshold: thin smoke drifting over a spot could flip a full-strength reflection on and off.
-    const float coverFade = saturate((b0 - max(GlassMinCoverage, 0.0f)) / 0.02f);
+    const bool gated = GlassMinCoverage >= 0.0f;
+    const bool scoreGate = gated && (Flags & 1024u) == 0u;
+    const float b0 = CoverageAt(p);
+    const bool covered = b0 > max(GlassMinCoverage, 1.0e-4f);
+    // 0.5.61: the statistics pixel of this 4x4 block this frame (rotates through all 16 over 16 frames).
+    const bool rotPixel = ((p.x & 3u) | ((p.y & 3u) << 2)) == (Frame & 15u);  // 0.5.96: also samples the standoff score
+    const bool statPixel = scoreGate && rotPixel;
+    const bool centre = (Flags & 32u) && all(p == Size / 2);
+    const bool ringPixel = all(p == Size / 2);  // 0.5.98
+    uint ringBits = 0u, ringInst = 0xFFFFFFFFu, gc_ = 0u, gcFirst = 0u, gcFall = 0u;
+    float ringT = 0.0f, ringStand = -1.0f, ringValid = -1.0f, ringLum = -1.0f;
+    // 0.5.115: 48 B per frame: + the reflection ray's hit instance, its LOD dword, the screen lookup result and the glow added
+    uint ringHit = 0xFFFFFFFFu, ringHitLod = 0u, ringLookup = 0u;
+    float ringGlow = 0.0f;
+    // 0.5.125: + 16 B: the reflection hit's albedo, emission, lamp light and ambient + sun (HDR luminance, albedo plain)
+    float4 ringParts = -1.0f;
+    #define GLASS_RING(stage) { if (ringPixel) { const uint ra_ = GlassRingBase + (Frame & 63u) * 64u; Out.Store4(ra_ + 48u, asuint(ringParts)); Out.Store4(ra_, uint4(Frame, (stage) | ringBits, ringInst, asuint(ringT))); Out.Store4(ra_ + 16u, uint4(gcFirst | (gcFall << 16), asuint(ringStand), asuint(ringValid), asuint(ringLum))); Out.Store4(ra_ + 32u, uint4(ringHit, ringHitLod, ringLookup, asuint(ringGlow))); } }
     const uint addr = p.y * PitchBytes + p.x * 4;
+    const uint reflAddr = GlassReflBase + (p.y * Size.x + p.x) * 8u;
+    Out.Store2(reflAddr, uint2(0u, 0u));  // 0.5.70: no glass reflection here unless written below
     const float3 scene = UnpackR11G11B10(Out.Load(addr));
     const float sceneLum = dot(scene, float3(0.3f, 0.59f, 0.11f)) + 0.02f;
-    if ((Flags & 32u) && all(p == Size / 2))
+    if (centre)
     {
         // 0.3.6: the final HDR colour and exposure at the crosshair (calibrates material emission against the screen).
         Rad.Store3(416, asuint(scene));
@@ -1032,12 +1362,15 @@ void Glass(uint3 tid : SV_DispatchThreadID)
     }
     // Debug colours (0.2.56): blue = not covered by OIT glass; magenta = covered, camera ray found nothing; pure red =
     // covered, but the depth buffer leaves the ray no room; yellow = hit a glass-tagged instance; white = hit an
-    // instance not tagged as glass (still reflected).
+    // instance not tagged as glass (still reflected). 0.5.61: orange = hit an object the game doesn't draw as glass
+    // (low score: only smoke covers it), so no reflection; green = a reflecting object still fading in.
     float3 dbg = float3(0.0f, 0.0f, 1.0f) + (covered ? float3(1.0f, 0.0f, 0.0f) : 0.0f);
     #define GLASS_DEBUG_OUT { if (debugView) Out.Store(addr, PackR11G11B10(lerp(scene, dbg * sceneLum * 2.0f, 0.6f))); }
-    if (GlassMinCoverage >= 0.0f && !covered)
+    if (covered) ringBits |= 16u;
+    if (gated && !covered && !statPixel)
     {
         GLASS_DEBUG_OUT
+        GLASS_RING(1u)
         return;
     }
 
@@ -1056,88 +1389,191 @@ void Glass(uint3 tid : SV_DispatchThreadID)
     RayDesc pr;
     pr.Origin = PerSceneRows[0].xyz;
     pr.Direction = dir;
-    pr.TMin = 0.5f;  // 0.2.67: past the player's own head (first person), which the camera ray would otherwise hit
+    // 0.2.67: was 0.5 m, to get past the player's own head. 0.5.82: 0.05 m; the camera ray skips the player since 0.5.69,
+    // and glass within 0.5 m of the camera got no reflection: a blank disc on a pane you stand close to.
+    pr.TMin = 0.05f;
     pr.TMax = opaque - (0.05f + opaque * 0.01f);
     if (pr.TMax <= pr.TMin)
     {
-        dbg = float3(1.0f, 0.0f, 0.0f);
+        if (covered) dbg = float3(1.0f, 0.0f, 0.0f);
         GLASS_DEBUG_OUT
+        GLASS_RING(2u)
         return;
     }
-    // 0.2.56: glass-tagged instances first; inside an OIT-covered pixel, anything else in front of the opaque surface is
-    // also the glass (some window panes are not tagged as see-through), so fall back to every instance.
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> gq;
+    // 0.2.56: glass-tagged instances first; then (optional) anything else in front of the opaque surface, for window
+    // panes whose material isn't tagged as see-through.
+    // 0.5.69: the camera ray skips the player (hit group 1). It used to force everything opaque, so the player tag did
+    // nothing here: the first-person gun's lens and sight parts are glass-tagged, and our copy of the gun (at its world
+    // position, not where the game draws the first-person view) was taken for a window: a pale gun-shaped reflection
+    // next to the real gun. Every other candidate is committed as before (no alpha test on the camera ray).
+    // 0.5.97: the candidate cap was 64. Candidates don't arrive nearest first, so a ray toward the Neon smoke and truss
+    // layers used up 64 far ones before reaching the storefront pane 0.4 m away: magenta (no pane) patches that changed
+    // every frame = the flicker behind the glass. 512 still guards against a runaway loop (the 0.3.2 hang).
+    #define GLASS_CAMERA_PROCEED(q) { gc_ = 0; while (q.Proceed()) { if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {         if (++gc_ > 512) q.Abort();         else if (q.CandidateInstanceContributionToHitGroupIndex() != 1u) q.CommitNonOpaqueTriangleHit(); } } }
+    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> gq;
     gq.TraceRayInline(Scene, RAY_FLAG_NONE, 0x02u, pr);
-    gq.Proceed();
+    GLASS_CAMERA_PROCEED(gq)
+    gcFirst = min(gc_, 65535u);
     bool tagged = gq.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     bool glassHit = tagged;
-    if (!tagged && covered && !(Flags & 512u))  // 0.4.10: Flags bit 9 = untagged-window fallback off
+    // 0.3.8: the untagged-window search rejects ordinary solid materials (family 0 with the solid flag), the player body
+    // (0.4.4) and family 7 (0.5.63: the effect / glowing-panel family: the Neon smoke plume; the glowing panels are solid
+    // G-buffer surfaces that already get the main reflection).
+    #define GLASS_FALLBACK_OK(q, ok) { ok = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT; if (ok) { if (q.CommittedInstanceContributionToHitGroupIndex() == 1u) ok = false; const uint fb_ = Lods.Load(q.CommittedInstanceID() * 80); const uint fm_ = (fb_ >> 13) & 0x7FFFu; if ((fb_ & 0x1Fu) == 0u && fm_ < MaterialCount && (Materials.Load(fm_ * 288 + 108) & 1u) != 0u) ok = false; if ((fb_ & 0x1Fu) == 7u) ok = false; } }
+    // 0.5.99: the search also runs in front of a tagged hit (up to its distance). The Neon storefront pane is untagged;
+    // every third frame the tagged ray found a tagged layer on the floor 18 m behind it, which skipped the search: the
+    // pane 0.4 m in front lost its reflection that frame (crosshair ring: reflected, reflected, rejected, ...).
+    RayDesc pf = pr;
+    bool doFall = (covered || statPixel) && !(Flags & 512u);  // 0.4.10: Flags bit 9 = untagged-window fallback off
+    if (tagged)
     {
-        gq.TraceRayInline(Scene, RAY_FLAG_NONE, 0xFBu, pr);  // 0.2.64: everything except effects (mask 0x04)
-        gq.Proceed();
-        // 0.3.8: the fallback exists for untagged window panes (other material families). Drifting smoke turns the OIT
-        // coverage on and off over the floor; at grazing angles the RT copy of the floor itself sits a little in front
-        // of the drawn floor, so it was taken for a pane and got a flickering reflection. Reject ordinary solid
-        // materials (family 0 with the solid flag) and hits that are not clearly in front of the surface behind.
-        if (gq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+        pf.TMax = gq.CommittedRayT() - 0.01f;
+        doFall = doFall && pf.TMax > pf.TMin;
+    }
+    if (doFall)
+    {
+        bool useFall = !tagged;
+        if (tagged)
         {
-            glassHit = (opaque - gq.CommittedRayT()) > 0.15f + 0.03f * min(opaque, 1000.0f);
-            if (gq.CommittedInstanceContributionToHitGroupIndex() == 1u)
-                glassHit = false;  // 0.4.4: the first-person player body is never a pane
-            // 0.3.10: and clearly off the plane of the surface behind (G-buffer normal there). Along a grazing ray, a
-            // centimetre between the RT floor and the drawn floor becomes tens of centimetres, so the distance along the
-            // ray let the walkway floor (a non-standard material family) pass as a pane. Panes stand well off the wall
-            // or floor behind them; a surface's own RT copy is within a few centimetres of its plane.
-            if (glassHit && depth > 0.0f)
+            RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> fq;
+            fq.TraceRayInline(Scene, RAY_FLAG_NONE, 0xEBu, pf);
+            GLASS_CAMERA_PROCEED(fq)
+            GLASS_FALLBACK_OK(fq, useFall)
+        }
+        if (useFall)
+        {
+            gq.TraceRayInline(Scene, RAY_FLAG_NONE, 0xEBu, pf);  // 0.2.64: everything except effects (mask 0x04)
+            GLASS_CAMERA_PROCEED(gq)
+            gcFall = min(gc_, 65535u);
+            ringBits |= 512u;  // fallback used
+            tagged = false;
+            GLASS_FALLBACK_OK(gq, glassHit)  // 0.5.64: the "clearly in front" tests below apply to tagged hits too
+        }
+    }    // 0.5.64: a pane stands clearly off the surface behind it (0.3.8 / 0.3.10 tests, until now only for the untagged
+    // search). In the Neon video (debug view), tagged see-through layers lying on solid surfaces (the overhead truss,
+    // the far walkway floor) flicked to "reflected" from frame to frame: their RT copy sits a few centimetres off the
+    // drawn surface, so with the jittered depth it landed in front of the margin in some frames and not in others. In
+    // dense smoke every pixel counts as covered, so the score couldn't reject them.
+    // 0.5.96: decided per object, not per pixel. Where the floor or an object (the Neon storefront: the cart, the floor at
+    // the pane's foot) sits just behind a real pane, the per-pixel test sat right on its margin and flipped with the
+    // jittered depth every frame: the pane's reflection flickered on and off in patches. Each sampled pixel now votes and
+    // the object's standoff score (share of its pixels clearly off the surface behind) decides for all its pixels: a pane
+    // standing in the open scores high; a layer lying on a surface scores low.
+    float standValid = 1.0f;
+    if (glassHit)
+    {
+        bool standoff = true;
+        if (depth > 0.0f)
+        {
+            const float tHit = gq.CommittedRayT();
+            if (opaque - tHit <= 0.15f + 0.03f * min(opaque, 1000.0f))
+                standoff = false;
+            else
             {
                 uint2 gs;
                 GDepth.GetDimensions(gs.x, gs.y);
                 const uint2 g = min(uint2(uv * float2(gs)), gs - 1);
                 const float3 nb = DecodeNormalWorld(GNormal[g].xy);
-                const float3 hitRel = dir * gq.CommittedRayT(), backRel = dir * opaque;
-                if (abs(dot(hitRel - backRel, nb)) < 0.2f)
-                    glassHit = false;
+                if (abs(dot(dir * (tHit - opaque), nb)) < 0.2f)
+                    standoff = false;
             }
-            const uint bucket = Lods.Load(gq.CommittedInstanceID() * 80);
-            const uint mat = (bucket >> 13) & 0x7FFFu;
-            if ((bucket & 0x1Fu) == 0u && mat < MaterialCount && (Materials.Load(mat * 288 + 108) & 1u) != 0u)
-                glassHit = false;
         }
-    }
-    if (!glassHit)
-    {
-        if ((Flags & 32u) && all(p == Size / 2))
+        const uint si = gq.CommittedInstanceID();
+        if (si < GlassStatCap && !(Flags & 65536u))
         {
-            Rad.Store(0, 0x504D4447u);
-            Rad.Store(4, covered ? 1u : 0u);
-            Rad.Store(8, 0xFFFFFFFFu);  // nothing hit
+            if (rotPixel)
+            {
+                Out.InterlockedAdd(GlassStandBase + si * 8u, 1u);
+                if (standoff)
+                    Out.InterlockedAdd(GlassStandBase + si * 8u + 4u, 1u);
+            }
+            float ss = asfloat(Out.Load(GlassStandScoreBase + si * 4u));
+            if (!(ss >= 0.0f && ss <= 1.0f)) ss = 0.0f;
+            standValid = saturate((ss - 0.35f) / 0.2f);
         }
-        GLASS_DEBUG_OUT
-        return;
+        else
+            standValid = standoff ? 1.0f : 0.0f;  // untracked record, or the 0.5.95 per-pixel test (Flags bit 16)
+        if (standValid <= 0.0f)
+            glassHit = false;
     }
-    dbg = tagged ? float3(1.0f, 1.0f, 0.0f) : float3(1.0f, 1.0f, 1.0f);
-    if ((Flags & 32u) && all(p == Size / 2))
+    const uint inst = glassHit ? gq.CommittedInstanceID() : 0xFFFFFFFFu;
+    if (gq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
-        // 0.2.62: F8 dump of what the glass pass found at the screen centre (read back by RecordGlassReflections):
-        // 0 'GDMP', 4 covered, 8 instance, 12 tagged, 16 distance, 20 LOD dword 0 (material | type), 24 primitive,
-        // 32..127 instance record (96 B), 128..415 standard material entry (288 B, if type 0).
-        const uint inst = gq.CommittedInstanceID();
-        const uint bucket = Lods.Load(inst * 80);
+        ringInst = gq.CommittedInstanceID();
+        ringT = gq.CommittedRayT();
+        ringBits |= tagged ? 32u : 0u;
+        ringBits |= ((Lods.Load(ringInst * 80) & 0x1Fu) << 24);  // family
+    }
+    ringStand = standValid;
+    if (glassHit) ringBits |= 64u;
+    // 0.5.61: count the sample (unbiased: taken whether or not the pixel is covered).
+    if (statPixel && glassHit && inst < GlassStatCap)
+    {
+        Out.InterlockedAdd(GlassStatsBase + inst * 8u, 1u);
+        if (covered)
+            Out.InterlockedAdd(GlassStatsBase + inst * 8u + 4u, 1u);
+    }
+    // 0.5.126: the camera ray above stops short of the visible surface, so a glass-tagged object the game draws as that
+    // surface (a G-buffer panel with pane-like material flags) was never sampled. On statistics pixels not covered by OIT
+    // glass, look for a glass-tagged object right at the visible surface: there, the game drew it solid (a sample that
+    // isn't see-through). Real panes aren't in the depth buffer, so they aren't found here.
+    if (statPixel && !glassHit && !covered && opaque > 0.2f && opaque < 1.0e4f)
+    {
+        RayDesc sr = pr;
+        sr.TMin = max(opaque - (0.1f + opaque * 0.02f), 0.05f);
+        sr.TMax = opaque + 0.1f + opaque * 0.02f;
+        RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> sq;
+        sq.TraceRayInline(Scene, RAY_FLAG_NONE, 0x02u, sr);
+        uint sc_ = 0;
+        while (sq.Proceed())
+        {
+            if (sq.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+            {
+                if (++sc_ > 64) sq.Abort();
+                else if (sq.CandidateInstanceContributionToHitGroupIndex() != 1u) sq.CommitNonOpaqueTriangleHit();
+            }
+        }
+        if (sq.CommittedStatus() == COMMITTED_TRIANGLE_HIT && sq.CommittedInstanceID() < GlassStatCap)
+            Out.InterlockedAdd(GlassStatsBase + sq.CommittedInstanceID() * 8u, 1u);
+    }
+    const float score = glassHit ? GlassScore(inst) : 0.0f;
+    // Full strength from a score of 0.9, none below 0.7 (0.5.63: was 0.85 / 0.5; smoke that covers itself scored up to
+    // 0.6, a real pane scores ~1 and loses only a little at its edges).
+    const float valid = (scoreGate ? saturate((score - 0.7f) / 0.2f) : 1.0f) * standValid;  // 0.5.96: x standoff
+    if (centre)
+    {
         Rad.Store(0, 0x504D4447u);
         Rad.Store(4, covered ? 1u : 0u);
-        Rad.Store(8, inst);
-        Rad.Store(12, tagged ? 1u : 0u);
-        Rad.Store(16, asuint(gq.CommittedRayT()));
-        Rad.Store(20, bucket);
-        Rad.Store(24, gq.CommittedPrimitiveIndex());
-        for (uint b = 0; b < 96; b += 4) Rad.Store(32 + b, Instances.Load(inst * 96 + b));
-        const uint mat = (bucket >> 13) & 0x7FFFu;
-        if ((bucket & 0x1Fu) == 0 && mat < MaterialCount)
-            for (uint m = 0; m < 288; m += 4) Rad.Store(128 + m, Materials.Load(mat * 288 + m));
+        Rad.Store(8, glassHit ? inst : 0xFFFFFFFFu);
+        Rad.Store(28, asuint(scoreGate ? score : -1.0f));
+        if (glassHit)
+        {
+            // 0.2.62: F8 dump of what the glass pass found at the screen centre (read back by RecordGlassReflections):
+            // 0 'GDMP', 4 covered, 8 instance, 12 tagged, 16 distance, 20 LOD dword 0 (material | type), 24 primitive,
+            // 28 score (0.5.61, -1 = no score gate), 32..127 instance record (96 B), 128..415 standard material entry.
+            const uint bucket = Lods.Load(inst * 80);
+            Rad.Store(12, tagged ? 1u : 0u);
+            Rad.Store(16, asuint(gq.CommittedRayT()));
+            Rad.Store(20, bucket);
+            Rad.Store(24, gq.CommittedPrimitiveIndex());
+            for (uint b = 0; b < 96; b += 4) Rad.Store(32 + b, Instances.Load(inst * 96 + b));
+            const uint mat = (bucket >> 13) & 0x7FFFu;
+            if ((bucket & 0x1Fu) == 0 && mat < MaterialCount)
+                for (uint m = 0; m < 288; m += 4) Rad.Store(128 + m, Materials.Load(mat * 288 + m));
+        }
     }
-
+    if (!glassHit || (gated && !covered) || valid <= 0.0f)
+    {
+        if (glassHit && covered && valid <= 0.0f)
+            dbg = float3(1.0f, 0.45f, 0.0f);  // orange: the game draws no glass on this object, only smoke over it
+        ringValid = valid;
+        GLASS_DEBUG_OUT
+        GLASS_RING(3u)
+        return;
+    }
+    dbg = valid < 1.0f ? float3(0.0f, 1.0f, 0.0f) : tagged ? float3(1.0f, 1.0f, 0.0f) : float3(1.0f, 1.0f, 1.0f);
     const float tg = gq.CommittedRayT();
-    const float3 n = GeometricNormal(gq.CommittedInstanceID(), gq.CommittedPrimitiveIndex(), gq.CommittedObjectToWorld3x4(), dir);
+    const float3 n = GeometricNormal(inst, gq.CommittedPrimitiveIndex(), gq.CommittedObjectToWorld3x4(), dir);
     const float ndv = saturate(dot(n, -dir));
     const float fresnel = 0.04f + 0.96f * pow(1.0f - ndv, 5.0f);
     const float3 r = reflect(dir, n);
@@ -1148,7 +1584,7 @@ void Glass(uint3 tid : SV_DispatchThreadID)
     ray.TMin = 0.0f;
     ray.TMax = MaxDistance;
     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> rq;
-    rq.TraceRayInline(Scene, RAY_FLAG_NONE, kSolidMask, ray);
+    rq.TraceRayInline(Scene, RAY_FLAG_NONE, kReflectMask, ray);  // 0.5.121
     PROCEED_ALPHA_NOPLAYER(rq)
 
     const float e = max(Exposure(), 1e-6f);
@@ -1159,18 +1595,155 @@ void Glass(uint3 tid : SV_DispatchThreadID)
         const float pix = PixelAngle();
         radiance = ShadeHit(ray.Origin, r, rq.CommittedRayT(), rq.CommittedInstanceID(), rq.CommittedPrimitiveIndex(),
             rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), ambient, 1.0f / e, float2(tg * pix, pix));
+        {
+            const float3 lw = float3(0.3f, 0.59f, 0.11f);
+            ringParts = float4(dot(g_shAlbedo, lw), dot(g_shEmission * e, lw), dot(g_shLamps * e, lw), dot(g_shOther * e, lw));
+        }
+        // 0.5.113: + the object's learned glow (video screens), from the main reflection pass's memory (Flags bit 20 = usable)
+        if ((Flags & (1u << 20)) && rq.CommittedInstanceID() < kShadeCacheCap)
+        {
+            const float3 glow = GlowOf(ReflGlowAddr(rq.CommittedInstanceID()), rq.CommittedInstanceID());
+            radiance += glow;
+            ringGlow = dot(glow * e, float3(0.3f, 0.59f, 0.11f));
+        }
+        else
+            ringGlow = (Flags & (1u << 20)) ? -2.0f : -1.0f;  // -1 = glow memory not usable in this pass
+        ringHit = rq.CommittedInstanceID();
+        ringHitLod = Lods.Load(rq.CommittedInstanceID() * 80u);
     }
     else
     {
-        radiance = float3(0.35f, 0.5f, 0.8f) * Ambient * 2.0f * saturate(r.z * 0.5f + 0.5f) / e;  // sky-ish
+        // 0.5.70: a softer, less blue miss colour (the old sky blue tinted every window in interiors such as Neon).
+        radiance = float3(0.55f, 0.6f, 0.7f) * Ambient * 1.6f * saturate(r.z * 0.5f + 0.5f) / e;
+    }
+    // 0.5.70: a hit that was visible last frame takes its real lit colour from last frame's image (the GI capture), as the
+    // main reflections do since 0.4.4: people, signs and lit walls keep the game's own detail and colour instead of our
+    // flat hit shading. Pixels behind smoke, glass and metal are marked unusable in that image and stay ray traced.
+    if ((Flags & 2048u) && rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+        ringLookup = 1u;  // 0.5.115: 1 off screen last frame
+        const float3 prel = ray.Origin + r * rq.CommittedRayT() - asfloat(Out.Load3(GlassCamBase));
+        const float4 clip = prel.x * asfloat(Out.Load4(GlassCamBase + 80)) + prel.y * asfloat(Out.Load4(GlassCamBase + 96)) +
+                            prel.z * asfloat(Out.Load4(GlassCamBase + 112)) + asfloat(Out.Load4(GlassCamBase + 128));
+        if (clip.w > 1e-4f)
+        {
+            const float2 uvp = float2(clip.x / clip.w * 0.5f + 0.5f, 0.5f - clip.y / clip.w * 0.5f);
+            if (all(uvp >= 0.0f) && all(uvp < 1.0f))
+            {
+                const uint2 pp = min(uint2(uvp * float2(Size)), Size - 1);
+                const uint2 d = PrevFrame.Load2((pp.y * Size.x + pp.x) * 8);
+                const float expect = length(prel);
+                ringLookup = PrevDistance(d.y) < 0.0f ? 2u : 3u;  // 2 under smoke/glass/metal, 3 distance mismatch
+                if (abs(PrevDistance(d.y) - expect) < 0.03f * expect + 0.1f)
+                {
+                    ringLookup = 4u;  // used
+                    radiance = UnpackR11G11B10(d.x) / e;
+                    ringBits |= 256u;  // 0.5.98: colour from last frame's image
+                }
+            }
+        }
     }
     radiance = min(radiance, 64.0f / e);
+    ringValid = valid;
+    ringLum = dot(radiance * e, float3(0.3f, 0.59f, 0.11f));
+    if (rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT) ringBits |= 128u;
     if (debugView)
     {
         GLASS_DEBUG_OUT
+        GLASS_RING(4u)
         return;
     }
-    Out.Store(addr, PackR11G11B10(scene + radiance * e * fresnel * GlassStrength * (GlassMinCoverage >= 0.0f ? coverFade : 1.0f)));
+    // 0.5.61: no per-pixel coverage fade any more (it followed the smoke density); the object's score sets the strength.
+    // 0.5.70: written to the reflection layer; GlassComposite blurs it and adds it to the scene.
+    Out.Store2(reflAddr, uint2(PackR11G11B10(radiance * e * fresnel * GlassStrength * valid), asuint(max(tg, 1e-3f))));
+    GLASS_RING(5u)
+}
+
+// 0.5.70: blurs the glass reflection layer and adds it to the scene. BlurPx = radius in pixels (0 = sharp). Only glass
+// pixels at a similar distance are mixed, so the blur never crosses a pane's edge or mixes two panes.
+[numthreads(8, 8, 1)]
+void GlassComposite(uint3 tid : SV_DispatchThreadID)
+{
+    const uint2 p = tid.xy;
+    if (p.x >= Size.x || p.y >= Size.y)
+        return;
+    const uint2 c = Out.Load2(GlassReflBase + (p.y * Size.x + p.x) * 8u);
+    const float tc = asfloat(c.y);
+    if (!(tc > 0.0f))
+        return;
+    float3 sum = UnpackR11G11B10(c.x);
+    float wsum = 1.0f;
+    if (BlurPx >= 0.5f)
+    {
+        const float step = BlurPx / 3.0f;
+        const float tol = 0.03f * tc + 0.05f;
+        [loop] for (int dy = -3; dy <= 3; ++dy)
+        {
+            [loop] for (int dx = -3; dx <= 3; ++dx)
+            {
+                if (dx == 0 && dy == 0)
+                    continue;
+                const int2 q = clamp(int2(p) + int2(round(float2(dx, dy) * step)), int2(0, 0), int2(Size) - 1);
+                const uint2 n = Out.Load2(GlassReflBase + (uint(q.y) * Size.x + uint(q.x)) * 8u);
+                const float tn = asfloat(n.y);
+                if (!(tn > 0.0f))
+                    continue;
+                const float w = exp(-float(dx * dx + dy * dy) / 4.5f) * saturate(1.0f - abs(tn - tc) / tol);
+                sum += UnpackR11G11B10(n.x) * w;
+                wsum += w;
+            }
+        }
+    }
+    const uint addr = p.y * PitchBytes + p.x * 4;
+    Out.Store(addr, PackR11G11B10(UnpackR11G11B10(Out.Load(addr)) + sum / wsum * RtFade()));  // 0.5.104: x fade-in
+}
+
+// 0.5.61: per-object score update, one thread per instance record, after Glass. Rises slowly toward this frame's
+// covered share (about 0.5 s to validate a new pane) and drops fast (smoke can't keep a phantom validated for long).
+[numthreads(64, 1, 1)]
+void GlassScoreUpdate(uint3 tid : SV_DispatchThreadID)
+{
+    const uint i = tid.x;
+    if (i >= GlassStatCap)
+        return;
+    // 0.5.96: standoff score (see Glass): about 0.5 s to accept, 0.25 s to drop; always updated (Flags bit 10 only
+    // skips the coverage score below).
+    const uint2 st = Out.Load2(GlassStandBase + i * 8u);
+    if (st.x >= 2u)
+    {
+        const uint ssa = GlassStandScoreBase + i * 4u;
+        float ss = asfloat(Out.Load(ssa));
+        if (!(ss >= 0.0f && ss <= 1.0f)) ss = 0.0f;
+        const float sr = float(min(st.y, st.x)) / float(st.x);
+        ss += (sr - ss) * (sr > ss ? 0.06f : 0.12f) * min(float(st.x) / 16.0f, 1.0f);
+        Out.Store(ssa, asuint(saturate(ss)));
+        Out.Store2(GlassStandBase + i * 8u, uint2(0u, 0u));
+    }
+    if (Flags & 1024u)
+        return;  // coverage score gate off
+    const uint2 c = Out.Load2(GlassStatsBase + i * 8u);
+    if (c.x < 2u)
+        return;  // too few samples: keep counting into next frame
+    const float ratio = float(min(c.y, c.x)) / float(c.x);
+    const uint sa = GlassStatsBase + GlassStatCap * 8u + i * 4u;
+    float s = asfloat(Out.Load(sa));
+    if (!(s >= 0.0f && s <= 1.0f)) s = 0.0f;
+    const float w = min(float(c.x) / 16.0f, 1.0f);
+    s += (ratio - s) * (ratio > s ? 0.04f : 0.25f) * w;
+    Out.Store(sa, asuint(saturate(s)));
+    Out.Store2(GlassStatsBase + i * 8u, uint2(0u, 0u));
+    // 0.5.126: "drawn solid" bit per record (Rad is rebound to the bit array for this dispatch). A glass-tagged object the
+    // game draws as an ordinary solid surface (never see-through where the glass ray finds it) gets the bit; the TLAS
+    // build then gives it the solid mask too, so reflection rays stop passing through it. Set only when both the score and
+    // this frame's samples say solid (a new pane starts at score 0 but samples near 1), cleared once either says see-through.
+    if ((Flags & 2u) && c.x >= 4u)
+    {
+        const uint word = (i >> 5) * 4u, bit = 1u << (i & 31u);
+        if (s < 0.15f && ratio < 0.15f)
+            Rad.InterlockedOr(word, bit);
+        else if (s > 0.5f || ratio > 0.5f)
+            Rad.InterlockedAnd(word, ~bit);
+    }
 }
 
 // ---------------------------------------------------------------- 0.3.0: RT diffuse GI
@@ -1191,6 +1764,7 @@ void Glass(uint3 tid : SV_DispatchThreadID)
 #define GiMaxHistory  FadeEnd
 #define GiRadius      BlurPx            // spatial filter radius, trace cells
 #define GiScreenLight GlassRoughScale   // 0.3.3: scale of light taken from last frame's image (1 = physical; >1 can run away)
+uint GiGlowAddr(uint inst) { return GiPrevOffset + 512u + GlowSlot(inst) * 16u; }  // 0.5.109: glow memory after the camera rows
 // Flags: bit 6 (64) = history usable, bit 7 (128) = debug: show the GI light alone (grey surfaces),
 //        bit 8 (256) = PrevFrame (last frame's lit image) usable.
 
@@ -1199,6 +1773,7 @@ struct GiPix
     bool   valid;
     float3 posRel, n, diffuse;
     float  viewDist;
+    float  ao;  // 0.5.135: the material's baked ambient occlusion (G-buffer t2.x)
 };
 
 GiPix LoadGiPixel(uint2 p)
@@ -1212,7 +1787,10 @@ GiPix LoadGiPixel(uint2 p)
     if (depth <= 0.0f)
         return s;
     s.n = DecodeNormalWorld(GNormal[g].xy);
-    s.diffuse = GAlbedo[g].rgb * (1.0f - saturate(GMat[g].z));
+    float giRough_, giMetal_;
+    GameRoughMetal(g, giRough_, giMetal_);  // 0.5.108: skin/hair are not metal
+    s.diffuse = GAlbedo[g].rgb * (1.0f - giMetal_);
+    s.ao = saturate(GMat[g].x);  // 0.5.135
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     const float4 h = ndc.x * PerSceneRows[13] + ndc.y * PerSceneRows[14] + depth * PerSceneRows[15] + PerSceneRows[16];
     s.posRel = h.xyz / h.w;
@@ -1252,8 +1830,7 @@ void GiUnpackCell(uint4 d, out float3 L, out float count, out float viewDist, ou
 
 uint2 GiCellPixel(uint2 q)
 {
-    const uint f = Frame & 3u;
-    const uint2 jitter = TraceScale > 1 ? uint2(f & 1u, f >> 1) : uint2(0, 0);
+    const uint2 jitter = TraceJitter(Frame);  // 0.5.92
     return min(q * TraceScale + jitter, Size - 1);
 }
 
@@ -1261,8 +1838,7 @@ uint2 GiCellPixel(uint2 q)
 // `prev`), the pixel last frame's jitter picked in that cell, and the view distance stored with it.
 float3 PrevSampleWorld(uint prev, uint2 pq, float dist)
 {
-    const uint f = (Frame - 1u) & 3u;
-    const uint2 jitter = TraceScale > 1 ? uint2(f & 1u, f >> 1) : uint2(0, 0);
+    const uint2 jitter = TraceJitter(Frame - 1u);  // 0.5.92
     const uint2 pp = min(pq * TraceScale + jitter, Size - 1);
     const float2 uv = (float2(pp) + 0.5f) / float2(Size);
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
@@ -1370,7 +1946,7 @@ void GiTrace(uint3 tid : SV_DispatchThreadID)
         const float selfGap = 0.1f + s.viewDist * 0.02f;
         [loop] for (uint tries = 0; tries < 4; ++tries)
         {
-            rq.TraceRayInline(Scene, RAY_FLAG_NONE, kSolidMask, ray);
+            rq.TraceRayInline(Scene, RAY_FLAG_NONE, kReflectMask, ray);  // 0.5.121
             PROCEED_ALPHA_NOPLAYER(rq)
             if (tries < 3 && rq.CommittedStatus() == COMMITTED_TRIANGLE_HIT && rq.CommittedRayT() < selfGap &&
                 (!rq.CommittedTriangleFrontFace() || rq.CommittedInstanceID() == selfInst))
@@ -1405,6 +1981,25 @@ void GiTrace(uint3 tid : SV_DispatchThreadID)
                         {
                             L = UnpackR11G11B10(d.x) / (e * max(GiStrength, 1e-3f)) * GiScreenLight;
                             onScreen = true;
+                            // 0.5.109: learn the hit object's glow on 1 cell in 16 per frame (rotating), not under smoke.
+                            const uint inst = rq.CommittedInstanceID();
+                            if (inst < kShadeCacheCap && asfloat(d.y) > 0.0f && LearnThisFrame(q))
+                            {
+                                const float3 ours = ShadeHit(ray.Origin, dir, rq.CommittedRayT(), inst, rq.CommittedPrimitiveIndex(),
+                                    rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), gameL * GiBounce, 1.0f / e, float2(0.0f, 0.02f));
+                                LearnGlow(GiGlowAddr(inst), inst, UnpackR11G11B10(d.x) / e, ours, 0.02f / e);
+                            }
+                        }
+                        else if (asfloat(d.y) < -5.0f && abs(-asfloat(d.y) - 10.0f - expect) < 0.03f * expect + 0.1f)
+                        {
+                            // 0.5.118: family 7 screens: covered pixels teach the glow (see TraceGlossy)
+                            const uint inst = rq.CommittedInstanceID();
+                            if (inst < kShadeCacheCap && GlowByPlace(inst) && LearnThisFrame(q))
+                            {
+                                const float3 ours = ShadeHit(ray.Origin, dir, rq.CommittedRayT(), inst, rq.CommittedPrimitiveIndex(),
+                                    rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), gameL * GiBounce, 1.0f / e, float2(0.0f, 0.02f));
+                                LearnGlow(GiGlowAddr(inst), inst, UnpackR11G11B10(d.x) / e, ours, 0.02f / e);
+                            }
                         }
                     }
                 }
@@ -1413,6 +2008,8 @@ void GiTrace(uint3 tid : SV_DispatchThreadID)
             {
                 L = ShadeHit(ray.Origin, dir, rq.CommittedRayT(), rq.CommittedInstanceID(), rq.CommittedPrimitiveIndex(),
                     rq.CommittedTriangleBarycentrics(), rq.CommittedObjectToWorld3x4(), gameL * GiBounce, 1.0f / e, float2(0.0f, 0.02f));
+                if (rq.CommittedInstanceID() < kShadeCacheCap)  // 0.5.109: the object's learned glow (video screens)
+                    L += GlowOf(GiGlowAddr(rq.CommittedInstanceID()), rq.CommittedInstanceID()) * GiScreenLight;
             }
         }
         else
@@ -1555,7 +2152,12 @@ void GiResolve(uint3 tid : SV_DispatchThreadID)
         wsum += w;
     }
     const float3 gameL = GiGameRadiance(addr, s.diffuse, e);
-    const float3 L = wsum > 1e-4f ? sum / wsum : gameL;
+    // 0.5.135: our GI light x the material's baked AO, as the game's own indirect light is (RT_FINDINGS: its SV_Target0
+    // carries the AO terms; Composite then adds the screen-space AO on top, for ours too). Without it creases, gaps and the
+    // ground behind objects were lit as brightly as open surfaces ("nothing dark anymore"). The game's light (fade-in
+    // blend) already has it.
+    const float3 rtL = wsum > 1e-4f ? sum / wsum * s.ao : gameL;
+    const float3 L = lerp(gameL / max(GiStrength, 1e-3f), rtL, RtFade());  // 0.5.104: fade-in from the game's light (x GiStrength below)
     const float3 diffuse = (Flags & 128u) ? float3(0.5f, 0.5f, 0.5f) : s.diffuse;
     Out.Store(addr, PackR11G11B10(diffuse * L * e * GiStrength));
 }
@@ -1581,25 +2183,31 @@ void GiCapture(uint3 tid : SV_DispatchThreadID)
     // 0.3.9: pixels covered by transparency (smoke, glass, effects) hold their colour, not the surface's: a GI ray hitting
     // the floor behind drifting smoke read the smoke and the GI flickered with it. Mark them unusable (ray falls back to
     // normal hit shading). GlassMomentIndex = the OIT optical-depth texture (half res), like the glass pass.
+    // 0.5.71: stored as -(dist + 10) instead of -1: GI still rejects them (negative), but reflections may opt in
+    // (Flags bit 12) and decode the distance, so smoke in front of a reflected surface shows in the reflection.
+    bool covered = false;
     if (GlassMomentIndex != 0u)
     {
         Texture2D<float> moments = ResourceDescriptorHeap[GlassMomentIndex];
         uint2 ms;
         moments.GetDimensions(ms.x, ms.y);
-        if (moments.Load(int3(min(p * ms / Size, ms - 1), 0)) > 0.001f)
-            dist = -1.0f;
+        covered = moments.Load(int3(min(p * ms / Size, ms - 1), 0)) > 0.001f;
     }
     // 0.5.29: metal pixels are mostly their own reflection. A reflection ray that took a metal surface's colour from this
     // image reflected its reflection, frame after frame: copper columns facing each other darkened to a deep red, like an
     // endless mirror tunnel. Metal hits are shaded directly instead (one bounce).
-    if (dist > 0.0f)
+    bool metal = false;
+    if (depth > 0.0f)
     {
         uint2 gs;
         GDepth.GetDimensions(gs.x, gs.y);
         const uint2 g = min(uint2((float2(p) + 0.5f) / float2(Size) * float2(gs)), gs - 1);
-        if (saturate(GMat[g].z) > 0.5f)
-            dist = -1.0f;
+        metal = !TableMaterial(g) && saturate(GMat[g].z) > 0.5f;  // 0.5.108
     }
+    if (metal)
+        dist = -1.0f;  // always unusable (0.5.29)
+    else if (covered)
+        dist = -(min(dist, 1.0e6f) + 10.0f);  // 0.5.71: unusable for GI, usable by reflections that want smoke
     Out.Store2((p.y * Size.x + p.x) * 8, uint2(GameSpec.Load(p.y * PitchBytes + p.x * 4), asuint(dist)));
 }
 
@@ -1773,6 +2381,7 @@ float DlAtten(uint type, DlLight l, float3 P, out float3 L, out float range)
 // attenuation / N.L, luminance, cos(axis, lamp->surface), noInvSq | gameShadow << 1.
 void DumpLamps(uint dl, float3 posRel, float3 n, uint pixelChannels, float viewDist)
 {
+    uint probeSelf = 0xFFFFFFFEu;  // 0.5.80: same self-object test as the lamp pass
     const float3 f = normalize(PerSceneRows[16].xyz);
     const float3 rr = normalize(PerSceneRows[13].xyz - dot(PerSceneRows[13].xyz, f) * f);
     const float3 uu = cross(rr, f);
@@ -1806,7 +2415,7 @@ void DumpLamps(uint dl, float3 posRel, float3 n, uint pixelChannels, float viewD
             if (att > 0.0f && range > 0.1f)
             {
                 hitT = LampShadowHit(PerSceneRows[0].xyz + posRel + n * (0.03f + viewDist * 0.001f),
-                                     rr * L.x + uu * L.y + f * L.z, range, viewDist, hitInst);
+                                     rr * L.x + uu * L.y + f * L.z, range, viewDist, n, posRel, probeSelf, hitInst);
                 if (hitT >= 0.0f)
                     hitBucket = Lods.Load(hitInst * 80);
                 else
@@ -1971,6 +2580,7 @@ void DlCull(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_
 }
 
 [numthreads(8, 8, 1)]
+#define DlLampRadius SunIntensity  // 0.5.79: lamp size for soft shadows, metres (the lamp pass has no sun term)
 void DlShade(uint3 tid : SV_DispatchThreadID)
 {
     const uint2 p = tid.xy;
@@ -1984,8 +2594,9 @@ void DlShade(uint3 tid : SV_DispatchThreadID)
     if (depth <= 0.0f)
         return;
     const float3 n = DecodeNormalWorld(GNormal[g].xy);
-    const float4 mat = GMat[g];
-    const float rough = clamp(saturate(mat.y), 0.03f, 1.0f), metal = saturate(mat.z);
+    float rough, metal;
+    GameRoughMetal(g, rough, metal);  // 0.5.108: skin/hair from the fallback
+    rough = clamp(rough, 0.03f, 1.0f);
     const float3 albedo = GAlbedo[g].rgb;
     const float3 diffuseColour = albedo * (1.0f - metal);
     const float3 f0 = lerp(0.04f.xxx, albedo, metal);
@@ -2060,6 +2671,7 @@ void DlShade(uint3 tid : SV_DispatchThreadID)
         }
     }
     const float3 origin = PerSceneRows[0].xyz + posRel + n * (0.03f + viewDist * 0.001f);
+    uint selfInst = 0xFFFFFFFEu;  // 0.5.80: looked up only if a shadow ray is blocked right at the surface
     [unroll] for (uint t = 0; t < 8; ++t)
     {
         if (!(topW[t] > 0.0f))
@@ -2068,13 +2680,29 @@ void DlShade(uint3 tid : SV_DispatchThreadID)
         if (t < shadowMax && topRange[t] > 0.1f)
         {
             uint blocker;
-            lit = LampShadowHit(origin, rr * topL[t].x + uu * topL[t].y + f * topL[t].z, topRange[t], viewDist, blocker) < 0.0f;
+            // 0.5.79: soft lamp shadows. The ray aims at a random point on a disc of radius DlLampRadius around the lamp,
+            // facing the pixel, different every frame (Frame) and per lamp; Ray Reconstruction averages it into a
+            // penumbra. Radius 0 = the old hard shadow at the lamp's centre.
+            float3 dirW = rr * topL[t].x + uu * topL[t].y + f * topL[t].z;
+            float len = topRange[t];
+            if (DlLampRadius > 0.0f)
+            {
+                const float3 tb = normalize(abs(dirW.z) < 0.9f ? cross(dirW, float3(0.0f, 0.0f, 1.0f)) : cross(dirW, float3(1.0f, 0.0f, 0.0f)));
+                const float3 bb = cross(dirW, tb);
+                const float fr = float(Frame & 63u);
+                const float u1 = Ign(float2(p) + 5.588238f * fr + 13.7f * float(t));
+                const float u2 = Ign(float2(p.yx) + 3.1754f * fr + 29.3f * float(t) + 7.0f);
+                const float rad = DlLampRadius * sqrt(u1), phi = 6.2831853f * u2;
+                const float3 toLamp = dirW * (len + 0.1f) + (tb * cos(phi) + bb * sin(phi)) * rad;  // range = distance - 0.1
+                len = length(toLamp) - 0.1f;
+                dirW = toLamp / max(length(toLamp), 1e-4f);
+            }
+            lit = len <= 0.1f || LampShadowHit(origin, dirW, len, viewDist, n, posRel, selfInst, blocker) < 0.0f;
         }
-        if (lit)
-        {
-            sumD += topD[t];
-            sumS += topS[t];
-        }
+        // 0.5.106: lamp shadows fade in after a load (unshadowed light fades out).
+        const float wl = lit ? 1.0f : 1.0f - RtFade();
+        sumD += topD[t] * wl;
+        sumS += topS[t] * wl;
     }
     const float e = max(Exposure(), 1e-6f);
     const float3 addD = diffuseColour * sumD * e * DlScale * LocalLightScale;
@@ -2144,8 +2772,8 @@ void RrGuides(uint3 tid : SV_DispatchThreadID)
         return;
     }
     const float3 n = DecodeNormalWorld(GNormal[g].xy);
-    const float4 mat = GMat[g];
-    const float rough = saturate(mat.y), metal = saturate(mat.z);
+    float rough, metal;
+    GameRoughMetal(g, rough, metal);  // 0.5.108
     const float3 albedo = GAlbedo[g].rgb;
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
     const float4 h = ndc.x * PerSceneRows[13] + ndc.y * PerSceneRows[14] + depth * PerSceneRows[15] + PerSceneRows[16];

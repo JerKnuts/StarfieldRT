@@ -20,7 +20,10 @@ namespace rt
         float sunRadiusDeg = 0.15f;   // apparent angular radius of the sun
         int   maxBlurPx = 4;        // largest filter radius
         int   softScale = 2;         // 0.2.2: soft shadows trace one sample per softScale x softScale pixels
+        bool  phantomDetect = true;  // 0.5.134: objects the game doesn't draw cast no RT shadow ([RT] bPhantomDetect)
     };
+    // 0.5.134: GPU address of the phantom bits (1 per instance record, "the game doesn't draw it"), or 0.
+    D3D12_GPU_VIRTUAL_ADDRESS PhantomBits();
 
     void SetSunShadowSettings(const SunShadowSettings& s);
 

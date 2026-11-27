@@ -3,6 +3,8 @@
 #include <SFSE/SFSE.h>  // CommonLibSF must come before any Windows headers
 
 #include "RtShadows.h"
+#include "DeviceHooks.h"  // 0.5.123: DredMark
+#include "Blas.h"  // 0.5.106: RtFadeIn
 #include "generated/RtProbeCS.h"
 #include "generated/RtSunShadowCS.h"
 #include "generated/RtSunDenoiseCS.h"
@@ -32,6 +34,8 @@ namespace rt
         ComPtr<ID3D12PipelineState> g_pso;
         ComPtr<ID3D12PipelineState> g_denoisePso;      // 0.1.30: soft shadow filter (pass 2)
         ComPtr<ID3D12Resource>      g_visBuffer;       // 0.1.30: per-pixel pass-1 results, 8 B per pixel
+        ComPtr<ID3D12Resource>      g_phantom;         // 0.5.134: phantom bits (64 KB) + per-record counts (4 B), always a UAV
+        constexpr std::uint64_t     kPhantomBytes = 65536 + (std::uint64_t(1) << 19) * 4;
         std::uint64_t               g_visBytes = 0;
         std::vector<ComPtr<ID3D12Resource>> g_oldVisBuffers;  // kept alive after a resize (may still be in flight)
         std::atomic<bool>           g_softLive{ true };
@@ -47,7 +51,7 @@ namespace rt
                 { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0 },  // depth at table +0
                 { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 2 },  // mask at table +2
             };
-            D3D12_ROOT_PARAMETER1 p[12]{};
+            D3D12_ROOT_PARAMETER1 p[13]{};
             p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             p[0].Constants = { 2, 0, 14 };
             auto descriptor = [](D3D12_ROOT_PARAMETER1& q, D3D12_ROOT_PARAMETER_TYPE type, UINT reg, UINT space) {
@@ -66,6 +70,7 @@ namespace rt
             descriptor(p[9], D3D12_ROOT_PARAMETER_TYPE_SRV, 5, 1);  // t5 space1: alpha params (0.1.26)
             descriptor(p[10], D3D12_ROOT_PARAMETER_TYPE_SRV, 6, 1); // t6 space1: geometry pool indices (0.1.29)
             descriptor(p[11], D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 1); // u1 space1: soft shadow buffer (0.1.30)
+            descriptor(p[12], D3D12_ROOT_PARAMETER_TYPE_UAV, 2, 1); // u2 space1: phantom detector (0.5.134)
             for (auto& q : p) q.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             D3D12_STATIC_SAMPLER_DESC sampler{};
             sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -76,7 +81,7 @@ namespace rt
             sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
             desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-            desc.Desc_1_1 = { 12, p, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED };
+            desc.Desc_1_1 = { 13, p, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED };  // 0.5.136: was 12 (0.5.134 added u2 but not the count: no RT sun shadows)
             ComPtr<ID3DBlob> blob, error;
             if (FAILED(D3D12SerializeVersionedRootSignature(&desc, &blob, &error))) {
                 REX::WARN("Starfield RT: sun shadow root signature: {}", error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
@@ -389,6 +394,7 @@ namespace rt
             list->SetComputeRootShaderResourceView(10, in.vegMaterials ? in.vegMaterials : in.lods);
             list->SetComputeRootShaderResourceView(11, in.alphaParams ? in.alphaParams : in.lods);
             list->SetComputeRootShaderResourceView(12, in.indexPool ? in.indexPool : in.lods);
+            rt::DredMark(list, L"SFRT RtShadows probePso #1");
             list->Dispatch((kProbeSamples + 63) / 64, 1, 1);
             D3D12_RESOURCE_BARRIER b{};
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -507,7 +513,8 @@ namespace rt
             in.alphaParams ? in.alphaParamsCount : 0u,
             sunTan, static_cast<UINT>((std::clamp)(g_settings.rays, 1, 16)), static_cast<UINT>(in.frame),
             (soft ? 1u : 0u) | (static_cast<UINT>((std::clamp)(g_settings.maxBlurPx, 1, 32)) << 8) |
-                (static_cast<UINT>((std::clamp)(g_settings.softScale, 1, 4)) << 16) };
+                (static_cast<UINT>((std::clamp)(g_settings.softScale, 1, 4)) << 16) |
+                (static_cast<UINT>(RtFadeIn() * 255.0f + 0.5f) << 20) };  // 0.5.106: fade-in
         const UINT traceScale = soft ? static_cast<UINT>((std::clamp)(g_settings.softScale, 1, 4)) : 1u;
         static_assert(sizeof(c) == 56);
         D3D12_RESOURCE_BARRIER uav{};
@@ -528,8 +535,31 @@ namespace rt
         list->SetComputeRootShaderResourceView(9, in.alphaParams ? in.alphaParams : in.tlas);
         list->SetComputeRootShaderResourceView(10, in.indexPool ? in.indexPool : in.tlas);
         list->SetComputeRootUnorderedAccessView(11, g_visBuffer->GetGPUVirtualAddress());
+        // 0.5.134: phantom detector buffer (bits + counts), always a UAV; alphaFlags bit 8 = bound.
+        if (!g_phantom) {
+            D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_DEFAULT };
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = kPhantomBytes;
+            bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                    IID_PPV_ARGS(&g_phantom)))) {
+                g_phantom.Reset();
+            } else {
+                g_phantom->SetName(L"StarfieldRT phantom detector");
+            }
+        }
+        if (g_phantom && g_settings.phantomDetect) {
+            c.alphaFlags |= 256u;
+            list->SetComputeRoot32BitConstants(0, 1, &c.alphaFlags, 6);
+        }
+        list->SetComputeRootUnorderedAccessView(12, g_phantom ? g_phantom->GetGPUVirtualAddress() : g_visBuffer->GetGPUVirtualAddress());
         {
             const UINT tw = (in.width + traceScale - 1) / traceScale, th = (in.height + traceScale - 1) / traceScale;
+            rt::DredMark(list, L"SFRT RtShadows sun shadow trace #2");
             list->Dispatch((tw + 7) / 8, (th + 7) / 8, 1);  // 0.2.2: soft shadows trace at 1/traceScale resolution
         }
         list->ResourceBarrier(1, &uav);
@@ -537,6 +567,7 @@ namespace rt
         if (soft) {
             // 0.1.30 pass 2: penumbra-aware filter from the vis buffer into the engine mask.
             list->SetPipelineState(g_denoisePso.Get());
+            rt::DredMark(list, L"SFRT RtShadows denoisePso #3");
             list->Dispatch((in.width + 7) / 8, (in.height + 7) / 8, 1);
             list->ResourceBarrier(1, &uav);
         }
@@ -544,4 +575,10 @@ namespace rt
         RecordProbe(device, list, in);
         return "applied";
     }
+}
+
+namespace rt
+{
+    // 0.5.134: see the phantom detector (RtSunShadow.hlsl). 0 when off or not created yet.
+    D3D12_GPU_VIRTUAL_ADDRESS PhantomBits() { return g_phantom && g_settings.phantomDetect ? g_phantom->GetGPUVirtualAddress() : 0; }
 }

@@ -23,6 +23,7 @@ namespace rt
         bool glassSeparate = true;       // 0.2.44; 0.2.50: on, only reflection rays skip the tagged see-through materials: glass (material flags +108 bit 0 clear) gets instance mask 0x02, solid 0x01
         float skinRadius = 20.0f;        // 0.2.32: skinned characters within this distance join the RT scene (0 = none)
         int   skinSlots = 32;            // 0.2.32: at most this many skinned instances (max 128; a character is several)
+        float tlasMinAngle = 0.002f;     // 0.5.100: rigid objects smaller than this on screen (bounding radius / distance) are left out (0 = off)
         int  tlasCullDistance = 1500;    // 0.2.3: instances farther than this from the camera are left out (0 = off)           // 0.1.23: alpha-test materials with an opacity texture (leaves, grass, fences)
     };
 
@@ -42,6 +43,13 @@ namespace rt
     // 0.3.7: true while loading and for ~3 s after the scene reports ready (extended by TLAS reallocations in that
     // window). Every save-load GPU hang so far happened in the first second after "ready", in a reflection/glass/GI pass.
     bool SceneSettling();
+    // 0.5.104: 0 while settling, then rises to 1 over about 0.75 s (reflections, GI and thin glass fade in after a load).
+    float RtFadeIn();
+    // 0.5.111: dump entry `material` of every CPU-readable structured buffer in the global scene table (slots 0..63) on
+    // the next frame. For finding the material tables of families other than 0 (standard) and 3 (vegetation).
+    void RequestTableDump(std::uint32_t family, std::uint32_t material);
+    // 0.5.106: [RT] fRtSettleSeconds (wait after the scene is ready) and fRtFadeSeconds (fade-in length).
+    void SetLoadTiming(float settleSeconds, float fadeSeconds);
 
     // Once per frame, on an engine command list that is about to run compute work.
     // `globalTable` is the scene root table (compute root parameter 1, space 2).

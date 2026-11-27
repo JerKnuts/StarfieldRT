@@ -11,6 +11,8 @@ namespace rt
     // 0.5.13: pause Ray Reconstruction live (the game's DLSS-SR runs instead). Returns true when now paused.
     bool ToggleRrPaused();
     void SetRrPaused(bool paused);  // 0.5.28: baseline off = paused
+    bool RrPaused();                // 0.5.77 (F8 master switch)
+    int FrameGenMode();             // 0.5.90: -1 unknown, 0 off, 1 on, 2 auto (the game's slDLSSGSetOptions)
     // 0.5.4: the game ran DLSS within the last 2 seconds (the RR guide pass is skipped otherwise).
     bool DlssRunning();
     // 0.5.7: DLSS Ray Reconstruction ran in place of DLSS-SR on the latest DLSS frame.

@@ -3,11 +3,14 @@
 #include <SFSE/SFSE.h>  // CommonLibSF must come before any Windows headers
 
 #include "Reflections.h"
+#include "Blas.h"  // 0.5.104: RtFadeIn
 #include "DeviceHooks.h"  // 0.2.60: FindUploadBuffer (local-light copies)
 #include "StreamlineHooks.h"  // 0.5.7: RR raw mode
 #include "generated/RtReflectDebugCS.h"
 #include "generated/RtReflectResolveCS.h"
 #include "generated/RtGlassCS.h"  // 0.2.51 (G3): Glass entry of shaders/RtReflectDebug.hlsl
+#include "generated/RtGlassScoreCS.h"  // 0.5.61: GlassScoreUpdate entry (per-object glass score)
+#include "generated/RtGlassCompositeCS.h"  // 0.5.70: GlassComposite entry (blur + add)
 #include "generated/RtGiTraceCS.h"     // 0.3.0: GI entries of shaders/RtReflectDebug.hlsl
 #include "generated/RtGiTemporalCS.h"
 #include "generated/RtGiResolveCS.h"
@@ -35,6 +38,14 @@ namespace rt
 {
     namespace
     {
+        // 0.5.104: every pass gets the fade-in in Flags bits 24..31 (RtFade() in the shader).
+        template <class C>
+        void PushConstants(ID3D12GraphicsCommandList* list, C& c)
+        {
+            const UINT fade = static_cast<UINT>(RtFadeIn() * 255.0f + 0.5f);
+            c.flags = (c.flags & 0x00FFFFFFu) | (fade << 24);
+            list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        }
         ReflectionSettings          g_settings;
         std::atomic<int>            g_mode{ 0 };
         std::mutex                  g_lock;           // recording can happen on different render threads
@@ -42,6 +53,8 @@ namespace rt
         ComPtr<ID3D12PipelineState> g_pso;
         ComPtr<ID3D12PipelineState> g_resolvePso;     // 0.2.29: glossy filter + composite
         ComPtr<ID3D12PipelineState> g_glassPso;       // 0.2.51 (G3): thin-glass reflections
+        ComPtr<ID3D12PipelineState> g_glassScorePso;  // 0.5.61: per-object score update after the glass pass
+        ComPtr<ID3D12PipelineState> g_glassCompositePso;  // 0.5.70: blurs the glass reflection layer into the scene
         ComPtr<ID3D12PipelineState> g_giTracePso, g_giTemporalPso, g_giResolvePso;  // 0.3.0: RT diffuse GI
         ComPtr<ID3D12PipelineState> g_giCapturePso;   // 0.3.3: last frame's lit image for GI
         ComPtr<ID3D12PipelineState> g_reflTemporalPso;  // 0.3.4: temporal accumulation of RT reflections
@@ -59,6 +72,7 @@ namespace rt
         ComPtr<ID3D12Resource>      g_dlTiles, g_dlDiff, g_dlSpec;   // tile lamp lists; RT0 / RT1 working copies (UAV)
         std::uint64_t               g_dlTilesBytes = 0, g_dlBufBytes = 0;
         std::atomic<int>            g_dlMode{ 1 };
+        std::uint32_t               g_dlFrame = 0;  // 0.5.79: changes the soft-shadow sample every frame
         // 0.5.34: when our RT lamp pass last ran (ms tick). Was a countdown of 3 lamp-list captures, which ran out within
         // one frame outdoors (the game reads its lamp list several times per frame there): the game's lamps came back for
         // part of the frame and the whole picture flickered between two brightness levels at Jemison.
@@ -83,7 +97,14 @@ namespace rt
         UINT                        g_giW = 0, g_giH = 0, g_giTs = 0;
         std::atomic<int>            g_giMode{ 1 };
         ComPtr<ID3D12Resource>      g_glassBuf;       // 0.2.51: copy of the HDR target, COPY_DEST between uses
+        ComPtr<ID3D12Resource>      g_solidBits;      // 0.5.126: 1 bit per record, "glass-tagged but drawn solid"; always a UAV
         std::uint64_t               g_glassBytes = 0;
+        // 0.5.61: after the image, per instance record: 8 B sample counts + 4 B score (see GlassScoreUpdate).
+        constexpr UINT              kGlassStatCap = 1u << 19;  // record indices (iTlasMaxInstances default 524288)
+        constexpr std::uint64_t     kGlassStatBytes = std::uint64_t(kGlassStatCap) * 24;  // 0.5.96: + standoff counts and score
+        std::uint32_t               g_glassFrame = 0;
+    std::uint32_t               g_glassNoPrevImage = 0;  // 0.5.95
+        bool                        g_glassHaveCam = false;  // 0.5.70: camera rows of the captured frame are in the buffer
         ReflectionInputs            g_lastIn{};       // 0.2.51: this frame's reflection inputs, for the glass pass
         int                         g_lastInAge = 1000;  // 0.2.52: glass passes since the reflection pass last recorded
         std::atomic<std::uint64_t>  g_lightCb{ 0 }, g_lightCounts{ 0 };  // 0.2.58: the game's local lights (0.2.60: our copy)
@@ -97,6 +118,41 @@ namespace rt
         ComPtr<ID3D12Resource>      g_glassDumpReadback;
         int                         g_glassDumpPending = 0;  // glass passes to wait before reading (0 = none)
         constexpr UINT              kGlassDumpBytes = 432;
+        constexpr UINT              kGlassRingBytes = 64 * 64;  // 0.5.98: per-frame centre-pixel ring, after the camera rows; 0.5.115: 32 -> 48 B; 0.5.125: 64 B
+
+        // 0.5.98: what the glass pass decided at the crosshair over the last 64 frames (oldest first).
+        void LogGlassRing(const std::uint32_t* r)
+        {
+            static const char* const kStage[6] = { "?", "no glass coverage", "no room for the ray", "rejected", "debug view", "reflected" };
+            std::uint32_t newest = 0;
+            for (int i = 0; i < 64; ++i) newest = (std::max)(newest, r[i * 16]);
+            REX::INFO("Starfield RT: [G3] crosshair over the last 64 frames (frame: stage | covered tagged hit fallback reflHit screenColour | "
+                      "family, instance, distance m, candidates first/fallback, standoff, weight, reflection HDR lum):");
+            for (std::uint32_t f = newest - 63; f <= newest; ++f) {
+                const std::uint32_t* e = r + (f & 63u) * 16;
+                if (e[0] != f) continue;
+                const std::uint32_t b = e[1];
+                float t, st, va, lum;
+                std::memcpy(&t, &e[3], 4); std::memcpy(&st, &e[5], 4); std::memcpy(&va, &e[6], 4); std::memcpy(&lum, &e[7], 4);
+                REX::INFO("Starfield RT: [G3]   {}: {:<19} | {}{}{}{}{}{} | fam {:2}, inst {}, {:.2f}, cand {}/{}, standoff {:.2f}, weight {:.2f}, lum {:.3f}",
+                    f, kStage[(std::min)(b & 15u, 5u)], (b & 16u) ? "C" : "-", (b & 32u) ? "T" : "-", (b & 64u) ? "H" : "-",
+                    (b & 512u) ? "F" : "-", (b & 128u) ? "R" : "-", (b & 256u) ? "S" : "-", (b >> 24) & 0x1Fu,
+                    e[2] == 0xFFFFFFFFu ? -1 : static_cast<long long>(e[2]), t, e[4] & 0xFFFFu, e[4] >> 16, st, va, lum);
+                // 0.5.115: what the reflection ray hit
+                static const char* const kLook[5] = { "screen colours off", "off screen last frame", "under smoke/glass/metal", "distance mismatch", "screen colour used" };
+                float glow;
+                std::memcpy(&glow, &e[11], 4);
+                if (e[8] != 0xFFFFFFFFu)
+                    REX::INFO("Starfield RT: [G3]        reflection hit inst {} (family {}, material {}): {}; glow lum {:.3f}{}",
+                        e[8], e[9] & 0x1Fu, (e[9] >> 13) & 0x7FFFu, kLook[(std::min)(e[10], 4u)], glow,
+                        glow == -1.0f ? " (glow memory not usable: sizes differ)" : "");
+                float parts[4];  // 0.5.125: what our shading of that hit is made of
+                std::memcpy(parts, &e[12], 16);
+                if (e[8] != 0xFFFFFFFFu && parts[0] >= 0.0f)
+                    REX::INFO("Starfield RT: [G3]        our shading: albedo {:.3f}, emission {:.3f}, game lamps {:.3f}, ambient + sun {:.3f} (HDR lum)",
+                        parts[0], parts[1], parts[2], parts[3]);
+            }
+        }
 
         void LogGlassDump(const std::uint32_t* d)
         {
@@ -114,6 +170,16 @@ namespace rt
             if (d[2] == 0xFFFFFFFFu) {
                 REX::INFO("Starfield RT: [G3] F8 dump: centre pixel covered by OIT glass = {}, camera ray hit nothing", d[1]);
                 return;
+            }
+            {  // 0.5.61: the object's glass score (share of its pixels the game draws see-through; 0.5.63: reflects from 0.7, full from 0.9)
+                float score;
+                std::memcpy(&score, &d[7], 4);
+                if (score < 0.0f)
+                    REX::INFO("Starfield RT: [G3] F8 glass score: filter off (Alt+Numpad 4)");
+                else
+                    REX::INFO("Starfield RT: [G3] F8 glass score of instance {}: {:.2f} -> {}", d[2], score,
+                        score >= 0.9f ? "real glass, full reflection" : score > 0.7f ? "partial reflection (fading in or out)"
+                                                                         : "NOT drawn as glass by the game (only smoke over it): no reflection");
             }
             float dist;
             std::memcpy(&dist, &d[4], 4);
@@ -191,6 +257,27 @@ namespace rt
             }
         }
 
+        void LogReflRayDump(const std::uint32_t* d)  // 0.5.74
+        {
+            if (d[0] != 0x444C4652u) {
+                REX::INFO("Starfield RT: [R] reflection ray at the crosshair: not traced this frame");
+                return;
+            }
+            auto f = [&](int i) { float v; std::memcpy(&v, &d[i], 4); return v; };
+            static const char* const kLookup[] = { "not tried", "off screen last frame", "on screen but unusable there (smoke/glass/metal)",
+                                                   "on screen, distance checked" };
+            REX::INFO("Starfield RT: [R] reflection ray at the crosshair (surface {:.2f} m away, roughness {:.3f}, weight {:.3f}): "
+                      "direction ({:.2f}, {:.2f}, {:.2f})", f(7), f(27), f(24), f(20), f(21), f(22));
+            if (!d[1]) {
+                REX::INFO("Starfield RT: [R]   no hit; uses the game's probe ({:.3f}, {:.3f}, {:.3f})", f(16), f(17), f(18));
+                return;
+            }
+            REX::INFO("Starfield RT: [R]   hit instance {} at {:.2f} m, LOD dword {:#x} (family {}, material {}); colour from {} ({})",
+                d[2], f(3), d[4], d[4] & 0x1Fu, (d[4] >> 13) & 0x7FFFu, d[6] ? "THE SCREEN" : "OUR SHADING", kLookup[(std::min)(d[5], 3u)]);
+            REX::INFO("Starfield RT: [R]   used HDR ({:.3f}, {:.3f}, {:.3f}); our shading HDR ({:.3f}, {:.3f}, {:.3f}); game probe ({:.3f}, {:.3f}, {:.3f})",
+                f(8), f(9), f(10), f(12), f(13), f(14), f(16), f(17), f(18));
+        }
+
         void LogMainDump(const std::uint32_t* d)
         {
             if (d[0] != 0x504D444Du) {
@@ -220,7 +307,8 @@ namespace rt
                 REX::INFO("Starfield RT: [R]   material entry: {}", words(32, 72));
                 if (d[27] != 0xFFFFFFFFu) REX::INFO("Starfield RT: [R]   texture set:    {}", words(104, 10));
             } else {
-                REX::INFO("Starfield RT: [R]   (family {} materials are not in the standard table; entry not dumped)", d[25] & 0x1Fu);
+                REX::INFO("Starfield RT: [R]   (family {} materials are not in the standard table; dumping the scene table next frame)", d[25] & 0x1Fu);
+                RequestTableDump(d[25] & 0x1Fu, (d[25] >> 13) & 0x7FFFu);  // 0.5.111
             }
         }
 
@@ -233,10 +321,10 @@ namespace rt
         D3D12_GPU_VIRTUAL_ADDRESS   g_lightLastSrc = 0;
 
         // 0.3.6: LocalShadowMax constant: shadow-ray count | emission model << 8 | half(emission scale) << 16.
-        UINT PackLocalShadows()
+        UINT PackLocalShadows(bool gi = false)
         {
             const UINT rays = static_cast<UINT>((std::clamp)(g_settings.localShadowRays, 0, 16));
-            const UINT hitRays = static_cast<UINT>((std::clamp)(g_settings.hitLampShadowRays, 0, 15));  // 0.4.5
+            const UINT hitRays = static_cast<UINT>((std::clamp)(gi ? g_settings.giLampShadowRays : g_settings.hitLampShadowRays, 0, 15));  // 0.4.5, 0.5.136
             const float scale = (std::clamp)(g_settings.emissiveScale, 0.0f, 60000.0f);
             return rays | (g_settings.emissiveModel ? 0x100u : 0u) | (hitRays << 9) |
                    (static_cast<UINT>(DirectX::PackedVector::XMConvertFloatToHalf(scale)) << 16);
@@ -358,6 +446,16 @@ namespace rt
             if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_glassPso)))) {
                 REX::WARN("Starfield RT: glass reflection pipeline failed (thin glass stays without RT reflections)");
                 g_glassPso.Reset();
+            }
+            pd.CS = { g_RtGlassCompositeCS, sizeof(g_RtGlassCompositeCS) };
+            if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_glassCompositePso)))) {
+                REX::WARN("Starfield RT: glass composite pipeline failed (thin glass stays without RT reflections)");
+                g_glassPso.Reset();
+            }
+            pd.CS = { g_RtGlassScoreCS, sizeof(g_RtGlassScoreCS) };
+            if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_glassScorePso)))) {
+                REX::WARN("Starfield RT: glass score pipeline failed (thin glass runs without the smoke filter)");
+                g_glassScorePso.Reset();
             }
             {  // 0.3.0: GI (optional)
                 bool ok = true;
@@ -550,7 +648,9 @@ namespace rt
         NoteRaw(raw);
         const UINT rts = raw ? 1u : static_cast<UINT>((std::clamp)(g_settings.traceScale, 1, 2));
         const std::uint64_t cells = std::uint64_t((width + rts - 1) / rts) * ((height + rts - 1) / rts);
-        const std::uint64_t radNeed = (std::max)(std::uint64_t(width) * height * 16, cells * 48 + 512);
+        // 0.5.74: + 256 B for the crosshair reflection-ray dump at width * height * 48 + 1024 (past any trace layout).
+        const std::uint64_t radNeed = (std::max)(std::uint64_t(width) * height * 48, cells * 48) + 1280 +
+                                      (std::uint64_t(1) << 19) * 32;  // >= the old max(w*h*16, cells*48 + 512); 0.5.75: + correction cache; 0.5.109: + glow memory
         if (radNeed > g_radBytes) {
             g_reflHaveHistory = false;
             if (g_rad) g_old.push_back(std::move(g_rad));
@@ -598,7 +698,10 @@ namespace rt
             UINT glassDepth, glassMoments; float glassStrength, glassMinCoverage; float localScale; UINT localShadows;
         } c{ width, height, static_cast<UINT>(mode), pitch, g_settings.maxDistance, g_settings.debugScale, records ? in.materialCount : 0u,
              (in.contactData ? 1u : 0u) | (g_settings.replaceAll ? 2u : 0u) | (g_settings.hitShadows ? 0u : 4u) |
-                 (g_settings.offscreenProbeFloor ? 1024u : 0u),  // 0.5.32
+                 (g_settings.offscreenProbeFloor ? 1024u : 0u) |  // 0.5.32
+                 (g_settings.reflectSmoke ? 4096u : 0u) |         // 0.5.71
+                 (g_settings.reflSourceView ? 8192u : 0u) |       // 0.5.72
+                 (g_settings.reflShadeCache ? 16384u : 0u),       // 0.5.75
              g_settings.sunIntensity, g_settings.ambient,
              // 0.5.24: in replace-all mode the fade range is unused; it carries the gloss (roughness scale) and strength
              g_settings.replaceAll ? g_settings.glossRoughScale : g_settings.fadeStart, g_settings.replaceAll ? g_settings.glossStrength : g_settings.fadeEnd,
@@ -648,11 +751,12 @@ namespace rt
         // 0.2.65: F8 dump of the screen-centre pixel (resolve pass), read back a few passes later
         if (g_mainDumpPending > 0 && --g_mainDumpPending == 0 && g_mainDumpReadback) {
             void* m = nullptr;
-            const D3D12_RANGE r{ 0, 4096 };
+            const D3D12_RANGE r{ 0, 4096 + 256 };
             if (SUCCEEDED(g_mainDumpReadback->Map(0, &r, &m)) && m) {
                 LogLampDump(static_cast<const std::uint32_t*>(m));         // 0.5.40: first 3328 bytes
                 LogGiDump(static_cast<const std::uint32_t*>(m) + 832);     // 0.5.47: GI rays at 3328
                 LogMainDump(static_cast<const std::uint32_t*>(m) + 896);   // the old 512-byte dump, at the end
+                LogReflRayDump(static_cast<const std::uint32_t*>(m) + 1024);  // 0.5.74: the crosshair's reflection ray
                 const D3D12_RANGE none{ 0, 0 };
                 g_mainDumpReadback->Unmap(0, &none);
             }
@@ -663,7 +767,7 @@ namespace rt
                 D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_READBACK };
                 D3D12_RESOURCE_DESC bd{};
                 bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                bd.Width = 4096;  // 0.5.40: + lamp probe
+                bd.Width = 4096 + 256;  // 0.5.40: + lamp probe; 0.5.74: + reflection-ray dump
                 bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
                 bd.SampleDesc.Count = 1;
                 bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -675,7 +779,7 @@ namespace rt
                 c.flags |= 32u;
             }
         }
-        list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        PushConstants(list, c);
         list->SetComputeRootConstantBufferView(1, in.perScene);
         list->SetComputeRootShaderResourceView(2, in.tlas);
         list->SetComputeRootDescriptorTable(3, in.gbufferTable);
@@ -691,8 +795,10 @@ namespace rt
         list->SetComputeRootShaderResourceView(19, prevImage ? g_giPrev->GetGPUVirtualAddress() : in.tlas);  // 0.4.4
         if (composite) {  // 0.2.34: the trace pass runs over the trace grid (1 ray per traceScale^2 pixels)
             const UINT s = c.traceScale;
+            rt::DredMark(list, L"SFRT reflection trace #1");
             list->Dispatch(((width + s - 1) / s + 7) / 8, ((height + s - 1) / s + 7) / 8, 1);
         } else {
+            rt::DredMark(list, L"SFRT reflection trace full #2");
             list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
         }
         if (composite) {
@@ -704,15 +810,18 @@ namespace rt
             if (temporal) {  // 0.3.4
                 const UINT s = c.traceScale;
                 list->SetPipelineState(g_reflTemporalPso.Get());
+                rt::DredMark(list, L"SFRT Reflections reflTemporalPso #3");
                 list->Dispatch(((width + s - 1) / s + 7) / 8, ((height + s - 1) / s + 7) / 8, 1);
                 list->ResourceBarrier(1, &uav);
             }
             list->SetPipelineState(g_resolvePso.Get());
+            rt::DredMark(list, L"SFRT Reflections resolvePso #4");
             list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
             if (mainDump) {  // 0.2.65
                 const D3D12_RESOURCE_BARRIER b = Transition(g_rad.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 list->ResourceBarrier(1, &b);
                 list->CopyBufferRegion(g_mainDumpReadback.Get(), 0, g_rad.Get(), std::uint64_t(width) * height * 16 - 4096, 4096);
+                list->CopyBufferRegion(g_mainDumpReadback.Get(), 4096, g_rad.Get(), std::uint64_t(width) * height * 48 + 1024, 256);  // 0.5.74
                 const D3D12_RESOURCE_BARRIER b2 = Transition(g_rad.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 list->ResourceBarrier(1, &b2);
                 g_mainDumpPending = 6;
@@ -807,10 +916,10 @@ namespace rt
             g_giBytes = need;
         }
         const bool raw = RawNow();  // 0.5.7
-        const UINT ts = raw ? 1u : static_cast<UINT>((std::clamp)(g_settings.giTraceScale, 1, 2));
+        const UINT ts = raw ? 1u : static_cast<UINT>((std::clamp)(g_settings.giTraceScale, 1, 4));  // 0.5.92: 4 = Medium/Low
         const UINT tw = (width + ts - 1) / ts, th = (height + ts - 1) / ts;
         const std::uint64_t cellBytes = std::uint64_t(tw) * th * 16;
-        const std::uint64_t bufNeed = cellBytes * 3 + 512;  // 0.4.7: 17 camera rows
+        const std::uint64_t bufNeed = cellBytes * 3 + 512 + (std::uint64_t(1) << 19) * 16;  // 0.4.7: 17 camera rows; 0.5.109: + glow memory
         if (bufNeed > g_giBufBytes) {
             if (g_giBuf) g_old.push_back(std::move(g_giBuf));
             if (!CreateBuffer(device, bufNeed, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_giBuf)) {
@@ -866,11 +975,11 @@ namespace rt
              histWrite, (std::max)(g_settings.giScreenLight, 0.0f),
              records && in.vegMaterials ? in.vegMaterialCount : 0u, records && in.alphaParams ? in.alphaParamsCount : 0u,
              traceOff, histRead, (std::max)(g_settings.giStrength, 0.0f), (std::max)(g_settings.giBounce, 0.0f),
-             (std::max)(g_settings.localLightScale, 0.0f), PackLocalShadows() };
+             (std::max)(g_settings.localLightScale, 0.0f), PackLocalShadows(true) };  // 0.5.136: GI's own hit lamp shadows
         static_assert(sizeof(c) == 108);
         list->SetComputeRootSignature(g_sig.Get());
         c.flags |= BindLocalLights(list, in.perScene, in.tlas);
-        list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        PushConstants(list, c);
         list->SetComputeRootConstantBufferView(1, in.perScene);
         list->SetComputeRootShaderResourceView(2, in.tlas);
         list->SetComputeRootDescriptorTable(3, in.gbufferTable);
@@ -890,18 +999,21 @@ namespace rt
         if (prevOk) {
             list->SetComputeRootShaderResourceView(19, g_giPrev->GetGPUVirtualAddress());
             c.flags |= 256u;
-            list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+            PushConstants(list, c);
         }
         D3D12_RESOURCE_BARRIER uav{};
         uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
         uav.UAV.pResource = g_giBuf.Get();
         list->SetPipelineState(g_giTracePso.Get());
+        rt::DredMark(list, L"SFRT Reflections giTracePso #5");
         list->Dispatch((tw + 7) / 8, (th + 7) / 8, 1);
         list->ResourceBarrier(1, &uav);
         list->SetPipelineState(g_giTemporalPso.Get());
+        rt::DredMark(list, L"SFRT Reflections giTemporalPso #6");
         list->Dispatch((tw + 7) / 8, (th + 7) / 8, 1);
         list->ResourceBarrier(1, &uav);
         list->SetPipelineState(g_giResolvePso.Get());
+        rt::DredMark(list, L"SFRT Reflections giResolvePso #7");
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
         // Output -> the game's indirect diffuse target.
@@ -937,7 +1049,7 @@ namespace rt
     }
 
     const char* RecordGiCapture(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* target, std::uint32_t depthIndex,
-        std::uint32_t momentIndex)
+        std::uint32_t momentIndex, D3D12_GPU_VIRTUAL_ADDRESS perSceneNow)
     {
         // 0.4.4: also captured for reflections alone (their on-screen hits use it).
         if ((g_giMode.load() == 0 || g_settings.giScreenLight <= 0.0f) && g_mode.load() != 5) return "off";
@@ -949,7 +1061,8 @@ namespace rt
         std::lock_guard lock(g_lock);
         if (!g_ready || !g_giCapturePso) return "skipped: pipeline unavailable";
         if (g_lastInAge > 8 || !g_lastIn.perScene || !g_lastIn.tlas) return "skipped: no recent reflection inputs";
-        const ReflectionInputs& in = g_lastIn;
+        ReflectionInputs in = g_lastIn;
+        if (perSceneNow) in.perScene = perSceneNow;  // 0.5.83: this frame's camera (distances match this frame's image)
         const UINT width = static_cast<UINT>(td.Width), height = td.Height;
         const UINT pitch = (width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
         const std::uint64_t colorNeed = std::uint64_t(pitch) * height, prevNeed = std::uint64_t(width) * height * 8;
@@ -1003,7 +1116,7 @@ namespace rt
         static_assert(sizeof(c) == 108);
         list->SetComputeRootSignature(g_sig.Get());
         list->SetPipelineState(g_giCapturePso.Get());
-        list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        PushConstants(list, c);
         list->SetComputeRootConstantBufferView(1, in.perScene);
         list->SetComputeRootShaderResourceView(2, in.tlas);
         list->SetComputeRootDescriptorTable(3, in.gbufferTable);  // unused, must be valid
@@ -1017,6 +1130,7 @@ namespace rt
         list->SetComputeRootConstantBufferView(17, in.perScene);
         list->SetComputeRootShaderResourceView(18, in.tlas);
         list->SetComputeRootShaderResourceView(19, in.tlas);
+        rt::DredMark(list, L"SFRT Reflections giCapturePso #8");
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
         {
             const D3D12_RESOURCE_BARRIER b[2] = {
@@ -1075,6 +1189,7 @@ namespace rt
             list->SetComputeRootConstantBufferView(17, lightCb);
             list->SetComputeRootShaderResourceView(18, counts);
             list->SetComputeRootShaderResourceView(19, counts);
+            rt::DredMark(list, L"SFRT Reflections lightCopyPso #9");
             list->Dispatch(16, 1, 1);
             {
                 const D3D12_RESOURCE_BARRIER b = Transition(slot, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kRead);
@@ -1153,7 +1268,7 @@ namespace rt
         static_assert(sizeof(c) == 108);
         list->SetComputeRootSignature(g_sig.Get());
         list->SetPipelineState(g_rrPso.Get());
-        list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        PushConstants(list, c);
         list->SetComputeRootConstantBufferView(1, in.perScene);
         list->SetComputeRootShaderResourceView(2, in.tlas);
         list->SetComputeRootDescriptorTable(3, in.gbufferTable);
@@ -1168,6 +1283,7 @@ namespace rt
         list->SetComputeRootConstantBufferView(17, in.perScene);
         list->SetComputeRootShaderResourceView(18, in.tlas);
         list->SetComputeRootShaderResourceView(19, in.tlas);
+        rt::DredMark(list, L"SFRT Reflections rrPso #10");
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
         D3D12_RESOURCE_BARRIER b[5] = { Transition(g_rrBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE) };
@@ -1236,10 +1352,22 @@ namespace rt
 
     void SetRrRaw(bool on) { g_rrRaw = on; }
     bool ToggleThinGlassFallback() { return g_settings.thinGlassFallback = !g_settings.thinGlassFallback; }  // 0.5.13
+    float AdjustThinGlassStrength(float factor)  // 0.5.81
+    {
+        std::lock_guard lock(g_lock);
+        g_settings.thinGlassStrength = (std::clamp)(g_settings.thinGlassStrength * factor, 0.05f, 10.0f);
+        return g_settings.thinGlassStrength;
+    }
+    bool ToggleReflShadeCache() { std::lock_guard lock(g_lock); return g_settings.reflShadeCache = !g_settings.reflShadeCache; }  // 0.5.75
+    bool ToggleReflSourceView() { std::lock_guard lock(g_lock); return g_settings.reflSourceView = !g_settings.reflSourceView; }  // 0.5.72
+    bool ToggleReflectSmoke() { std::lock_guard lock(g_lock); return g_settings.reflectSmoke = !g_settings.reflectSmoke; }  // 0.5.71
+    bool ToggleThinGlassScoreGate() { return g_settings.thinGlassScoreGate = !g_settings.thinGlassScoreGate; }  // 0.5.61
+    bool ToggleThinGlassScreenColours() { return g_settings.thinGlassScreenColours = !g_settings.thinGlassScreenColours; }  // 0.5.95
     bool ToggleRrRaw() { return !g_rrRaw.exchange(!g_rrRaw.load()); }
 
     // 0.5.28: baseline (everything off) setters.
     void SetReflectionModeRaw(int mode) { g_mode = mode; }
+    int ThinGlassMode() { std::lock_guard lock(g_lock); return g_settings.thinGlass; }  // 0.5.77
     void SetGiModeRaw(int mode) { g_giMode = (std::clamp)(mode, 0, 2); }
     void SetDirectLightsRaw(int mode)
     {
@@ -1340,8 +1468,9 @@ namespace rt
             float fadeStart, fadeEnd, probeAmbient, minWeight; UINT frame; float blurPx; UINT traceScale;
             UINT smoothTypes; float glassRoughScale; UINT vegCount, alphaParamsCount;
             UINT glassDepth, glassMoments; float glassStrength, glassMinCoverage; float localScale; UINT localShadows;
-        } c{ width, height, 0u, pitch, g_settings.maxDistance, 1.0f, records ? in.materialCount : 0u, 0u, 0.0f, 0.0f,
-             0.0f, 0.0f, 0.0f, 0.0f, 0u, 0.0f, 1u, 0u, 0.0f,
+        } c{ width, height, 0u, pitch, g_settings.maxDistance, 1.0f, records ? in.materialCount : 0u, 0u,
+             (std::max)(g_settings.rtLampRadius, 0.0f), 0.0f,  // 0.5.79: sun field = lamp radius (soft lamp shadows)
+             0.0f, 0.0f, 0.0f, 0.0f, g_dlFrame++, 0.0f, 1u, 0u, 0.0f,
              records && in.vegMaterials ? in.vegMaterialCount : 0u, records && in.alphaParams ? in.alphaParamsCount : 0u,
              tilesX, 0u, (std::max)(g_settings.rtLampScale, 0.0f), 0.0f,
              (std::max)(g_settings.localLightScale, 0.0f), PackLocalShadows() };
@@ -1349,7 +1478,7 @@ namespace rt
         list->SetComputeRootSignature(g_sig.Get());
         c.flags |= BindLocalLights(list, in.perScene, in.tlas);
         if (!(c.flags & 16u)) return "skipped: lamp list not usable";
-        list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        PushConstants(list, c);
         list->SetComputeRootConstantBufferView(1, in.perScene);
         list->SetComputeRootShaderResourceView(2, in.tlas);
         list->SetComputeRootDescriptorTable(3, in.gbufferTable);
@@ -1365,6 +1494,7 @@ namespace rt
         list->SetComputeRootUnorderedAccessView(4, g_dlTiles->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(13, in.tlas);
         list->SetPipelineState(g_dlCullPso.Get());
+        rt::DredMark(list, L"SFRT Reflections dlCullPso #11");
         list->Dispatch(tilesX, tilesY, 1);
         {
             const D3D12_RESOURCE_BARRIER b = Transition(g_dlTiles.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1374,6 +1504,7 @@ namespace rt
         list->SetComputeRootUnorderedAccessView(4, g_dlDiff->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(13, g_dlTiles->GetGPUVirtualAddress());
         list->SetPipelineState(g_dlShadePso.Get());
+        rt::DredMark(list, L"SFRT Reflections dlShadePso #12");
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
         {
             const D3D12_RESOURCE_BARRIER b[5] = {
@@ -1404,6 +1535,87 @@ namespace rt
     {
         g_glassDumpRequested = true;
         g_mainDumpRequested = true;  // 0.2.65
+    }
+
+    namespace
+    {
+        struct PassTimer  // 0.5.87
+        {
+            ComPtr<ID3D12QueryHeap> heap;
+            ComPtr<ID3D12Resource>  rb;
+            const std::uint64_t*    stamps = nullptr;
+            bool                    failed = false;
+            bool                    used[kTimerSlots]{};
+            std::uint64_t           index = 0;
+            UINT                    cur = 0;
+            bool                    open = false;
+            double                  sum = 0.0;
+            std::uint32_t           n = 0;
+        };
+        constexpr int kPassTimers = 5;
+        PassTimer g_passTimers[kPassTimers];
+        std::mutex g_passTimerLock;
+        const char* const kPassTimerNames[kPassTimers] = { "GI", "RT lamps", "thin glass", "last-frame image capture", "RR guide images" };
+    }
+
+    void PassTimerBegin(int ch, ID3D12Device* device, ID3D12GraphicsCommandList* list)
+    {
+        if (ch < 0 || ch >= kPassTimers || !device || !list || g_ticksPerMs <= 0.0) return;
+        std::lock_guard lock(g_passTimerLock);
+        PassTimer& t = g_passTimers[ch];
+        if (t.open) return;
+        if (!t.heap && !t.failed) {
+            D3D12_QUERY_HEAP_DESC hd{ D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kTimerSlots * 2, 0 };
+            D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_READBACK };
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = kTimerSlots * 2 * sizeof(std::uint64_t);
+            bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            void* m = nullptr;
+            if (FAILED(device->CreateQueryHeap(&hd, IID_PPV_ARGS(&t.heap))) ||
+                FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&t.rb))) ||
+                FAILED(t.rb->Map(0, nullptr, &m)) || !m) {
+                t.heap.Reset();
+                t.rb.Reset();
+                t.failed = true;
+                return;
+            }
+            t.stamps = static_cast<const std::uint64_t*>(m);
+        }
+        if (!t.heap) return;
+        // read the slot written kTimerSlots/2 recordings ago (long finished on the GPU)
+        const UINT old = static_cast<UINT>((t.index + kTimerSlots / 2) % kTimerSlots);
+        if (t.used[old]) {
+            const std::uint64_t a = t.stamps[old * 2], b = t.stamps[old * 2 + 1];
+            const double ms = b > a ? static_cast<double>(b - a) / g_ticksPerMs : -1.0;
+            if (ms >= 0.0 && ms < 1000.0) { t.sum += ms; ++t.n; }
+            t.used[old] = false;
+        }
+        if (t.n >= 600) {
+            REX::INFO("Starfield RT: PERF {} ({} frames): {:.2f} ms GPU", kPassTimerNames[ch], t.n, t.sum / t.n);
+            t.sum = 0.0;
+            t.n = 0;
+        }
+        t.cur = static_cast<UINT>(t.index % kTimerSlots);
+        list->EndQuery(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, t.cur * 2);
+        t.open = true;
+    }
+
+    void PassTimerEnd(int ch, ID3D12GraphicsCommandList* list, bool counted)
+    {
+        if (ch < 0 || ch >= kPassTimers || !list) return;
+        std::lock_guard lock(g_passTimerLock);
+        PassTimer& t = g_passTimers[ch];
+        if (!t.open || !t.heap) return;
+        t.open = false;
+        list->EndQuery(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, t.cur * 2 + 1);
+        if (counted) {
+            list->ResolveQueryData(t.heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, t.cur * 2, 2, t.rb.Get(), t.cur * 2 * sizeof(std::uint64_t));
+            t.used[t.cur] = true;
+            ++t.index;
+        }
     }
 
     void ForgetReflectionInputs()
@@ -1444,7 +1656,7 @@ namespace rt
     }
 
     const char* RecordGlassReflections(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* target,
-        std::uint32_t depthIndex, std::uint32_t momentIndex, D3D12_GPU_VIRTUAL_ADDRESS tlas)
+        std::uint32_t depthIndex, std::uint32_t momentIndex, D3D12_GPU_VIRTUAL_ADDRESS tlas, D3D12_GPU_VIRTUAL_ADDRESS perSceneNow)
     {
         std::lock_guard lock(g_lock);
         if (!g_settings.thinGlass) return "off";
@@ -1456,6 +1668,22 @@ namespace rt
         if (++g_lastInAge > 8) return "skipped: no recent reflection pass";
         ReflectionInputs in = g_lastIn;
         if (!tlas) return "skipped: no TLAS this frame";  // 0.2.59: never the previous pass's TLAS (may be freed)
+        {  // 0.5.83: count how often the reflection pass's camera was from another frame (the cause of jumpy glass reflections)
+            static std::uint32_t passes = 0, stale = 0, found = 0, oldInputs = 0;
+            ++passes;
+            if (perSceneNow) ++found;
+            if (perSceneNow && perSceneNow != in.perScene) ++stale;
+            if (g_lastInAge > 1) ++oldInputs;  // 0.5.95: the reflection pass's inputs (G-buffer table) were from an earlier frame
+            if (passes == 600) {
+                REX::INFO("Starfield RT: [G3] camera for thin glass (last 600 frames): this frame's found {} times; the reflection "
+                          "pass's camera was from another frame {} times (those frames used this frame's instead); reflection-pass "
+                          "inputs older than this frame {} times; last frame's image unusable for screen colours {} times",
+                    found, stale, oldInputs, g_glassNoPrevImage);
+                passes = stale = found = oldInputs = 0;
+                g_glassNoPrevImage = 0;
+            }
+        }
+        if (perSceneNow) in.perScene = perSceneNow;  // 0.5.83: the camera of this frame, not of the last recorded reflection pass
         in.tlas = tlas;
         if (!device || !list || !target || !in.tlas || !in.perScene) return "skipped: missing inputs";
         const D3D12_RESOURCE_DESC td = target->GetDesc();
@@ -1464,15 +1692,22 @@ namespace rt
         }
         const UINT width = static_cast<UINT>(td.Width), height = td.Height;
         const UINT pitch = (width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-        const std::uint64_t need = std::uint64_t(pitch) * height;
-        if (need > g_glassBytes) {
+        // 0.5.61: the per-object score area sits after the image, so the size must match exactly (a different image size
+        // would move it): recreate on any change. New buffers start zeroed (all scores 0: panes fade in over ~0.5 s).
+        const std::uint64_t imageBytes = (std::uint64_t(pitch) * height + 255) & ~255ull;
+        // 0.5.70: + the reflection layer (8 B per pixel) and the camera rows (272 B) for the on-screen lookup.
+        const std::uint64_t reflBytes = std::uint64_t(width) * height * 8;
+        const std::uint64_t camOff = imageBytes + kGlassStatBytes + reflBytes;
+        const std::uint64_t need = camOff + 512 + kGlassRingBytes;  // 0.5.98: + the centre-pixel ring
+        if (need != g_glassBytes) {
+            g_glassHaveCam = false;
             if (g_glassBuf) g_old.push_back(std::move(g_glassBuf));
             if (!CreateBuffer(device, need, true, D3D12_RESOURCE_STATE_COPY_DEST, g_glassBuf)) {
                 g_glassBytes = 0;
                 return "skipped: buffer allocation failed";
             }
             g_glassBytes = need;
-            REX::INFO("Starfield RT: [G3] glass reflection buffer {}x{} ({:.1f} MB)", width, height, need / 1048576.0);
+            REX::INFO("Starfield RT: [G3] glass reflection buffer {}x{} ({:.1f} MB, with the per-object glass scores)", width, height, need / 1048576.0);
         }
 
         D3D12_TEXTURE_COPY_LOCATION tex{};
@@ -1505,22 +1740,31 @@ namespace rt
             UINT glassDepth, glassMoments; float glassStrength, glassMinCoverage; float localScale; UINT localShadows;
         } c{ width, height, 8u, pitch, g_settings.maxDistance, 1.0f, records ? in.materialCount : 0u,
              (in.contactData ? 1u : 0u) | (g_settings.hitShadows ? 0u : 4u) | (g_settings.thinGlass == 2 ? 8u : 0u) |
-             (g_settings.thinGlassFallback ? 0u : 512u),
+             (g_settings.thinGlassFallback ? 0u : 512u) | (g_settings.thinGlassScoreGate && g_glassScorePso ? 0u : 1024u) |
+                 (g_settings.reflectSmoke ? 4096u : 0u) |  // 0.5.71
+                  (g_settings.thinGlassStandoffScore && g_glassScorePso ? 0u : 65536u),  // 0.5.96: per-object standoff
              g_settings.sunIntensity, g_settings.ambient,
-             0.0f, 0.0f, g_settings.probeAmbient, 0.0f, 0u, 0.0f, 1u, 0u, 0.0f,
+             0.0f, 0.0f, g_settings.probeAmbient, 0.0f, g_glassFrame++,
+             (std::max)(g_settings.thinGlassBlurPx, 0.0f) * static_cast<float>(height) / 1440.0f, 1u, 0u, 0.0f,  // 0.5.70: blur radius
              records && in.vegMaterials ? in.vegMaterialCount : 0u, records && in.alphaParams ? in.alphaParamsCount : 0u,
              depthIndex, momentIndex, (std::max)(g_settings.thinGlassStrength, 0.0f), g_settings.thinGlassMinCoverage,
              (std::max)(g_settings.localLightScale, 0.0f), PackLocalShadows() };
         static_assert(sizeof(c) == 108);
+        {  // 0.5.61: FadeStart / FadeEnd carry the score area's offset and size (the glass pass doesn't fade by roughness)
+            const UINT statsBase = static_cast<UINT>(imageBytes), statCap = kGlassStatCap;
+            std::memcpy(&c.fadeStart, &statsBase, 4);
+            std::memcpy(&c.fadeEnd, &statCap, 4);
+        }
         list->SetComputeRootSignature(g_sig.Get());
         list->SetPipelineState(g_glassPso.Get());
         c.flags |= BindLocalLights(list, in.perScene, in.tlas);  // 0.2.58
         // 0.2.62: F8 dump (read back a few glass passes later)
         if (g_glassDumpPending > 0 && --g_glassDumpPending == 0 && g_glassDumpReadback) {
             void* m = nullptr;
-            const D3D12_RANGE r{ 0, kGlassDumpBytes };
+            const D3D12_RANGE r{ 0, kGlassDumpBytes + kGlassRingBytes };
             if (SUCCEEDED(g_glassDumpReadback->Map(0, &r, &m)) && m) {
                 LogGlassDump(static_cast<const std::uint32_t*>(m));
+                LogGlassRing(static_cast<const std::uint32_t*>(m) + kGlassDumpBytes / 4);  // 0.5.98
                 const D3D12_RANGE none{ 0, 0 };
                 g_glassDumpReadback->Unmap(0, &none);
             }
@@ -1531,7 +1775,7 @@ namespace rt
                 D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_READBACK };
                 D3D12_RESOURCE_DESC bd{};
                 bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                bd.Width = kGlassDumpBytes;
+                bd.Width = kGlassDumpBytes + kGlassRingBytes;  // 0.5.98: + the ring
                 bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
                 bd.SampleDesc.Count = 1;
                 bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -1543,7 +1787,7 @@ namespace rt
                 c.flags |= 32u;
             }
         }
-        list->SetComputeRoot32BitConstants(0, 27, &c, 0);
+        PushConstants(list, c);
         list->SetComputeRootConstantBufferView(1, in.perScene);
         list->SetComputeRootShaderResourceView(2, in.tlas);
         list->SetComputeRootDescriptorTable(3, in.gbufferTable);  // unused by the glass pass, but must be valid
@@ -1555,8 +1799,56 @@ namespace rt
         list->SetComputeRootUnorderedAccessView(14, g_rad->GetGPUVirtualAddress());
         list->SetComputeRootShaderResourceView(15, records && in.vegMaterials ? in.vegMaterials : in.tlas);
         list->SetComputeRootShaderResourceView(16, records && in.alphaParams ? in.alphaParams : in.tlas);
-        list->SetComputeRootShaderResourceView(19, in.tlas);  // 0.3.3: PrevFrame placeholder (GI rebinds it)
+        // 0.5.70: last frame's lit image for on-screen hits (captured right after this pass last frame, with the camera
+        // rows this pass saved then).
+        const bool prevImage = g_glassHaveCam && g_giPrevValid && g_giPrevReadable && g_giPrev && g_giPrevW == width &&
+                               g_giPrevH == height && g_giPrevAge <= 2;
+        if (!prevImage) ++g_glassNoPrevImage;  // 0.5.95: counted for the [G3] line
+        if (prevImage && g_settings.thinGlassScreenColours) {
+            c.flags |= 2048u;
+            list->SetComputeRoot32BitConstants(0, 1, &c.flags, 7);
+        }
+        // 0.5.113: off-screen glass reflection hits add the objects' learned glow (video screens). The glow memory sits in
+        // the reflection buffer at an offset from the reflection pass's size, so only when both passes have the same size.
+        if (g_rad && g_reflW == width && g_reflH == height &&
+            g_radBytes >= std::uint64_t(width) * height * 48 + 1280 + (std::uint64_t(1) << 19) * 32) {
+            c.flags |= 1u << 20;
+            list->SetComputeRoot32BitConstants(0, 1, &c.flags, 7);
+        }
+        list->SetComputeRootShaderResourceView(19, prevImage ? g_giPrev->GetGPUVirtualAddress() : in.tlas);
+        rt::DredMark(list, L"SFRT thin glass #13");
         list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        if (g_glassScorePso) {  // 0.5.61: fold this frame's samples into each object's score (0.5.96: always: standoff score)
+            D3D12_RESOURCE_BARRIER u{};
+            u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            u.UAV.pResource = g_glassBuf.Get();
+            list->ResourceBarrier(1, &u);
+            // 0.5.126: the drawn-solid bits (u1 for this dispatch only; the score update doesn't use the reflection buffer)
+            if (!g_solidBits && !CreateBuffer(device, kGlassStatCap / 8, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_solidBits))
+                g_solidBits.Reset();
+            if (g_solidBits) {
+                list->SetComputeRootUnorderedAccessView(14, g_solidBits->GetGPUVirtualAddress());
+                c.flags |= 2u;
+                list->SetComputeRoot32BitConstants(0, 1, &c.flags, 7);
+            }
+            list->SetPipelineState(g_glassScorePso.Get());
+            rt::DredMark(list, L"SFRT Reflections glassScorePso #14");
+            list->Dispatch(kGlassStatCap / 64, 1, 1);
+            if (g_solidBits) {
+                list->SetComputeRootUnorderedAccessView(14, g_rad->GetGPUVirtualAddress());
+                c.flags &= ~2u;
+                list->SetComputeRoot32BitConstants(0, 1, &c.flags, 7);
+            }
+        }
+        {  // 0.5.70: blur the reflection layer and add it to the scene
+            D3D12_RESOURCE_BARRIER u{};
+            u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            u.UAV.pResource = g_glassBuf.Get();
+            list->ResourceBarrier(1, &u);
+            list->SetPipelineState(g_glassCompositePso.Get());
+            rt::DredMark(list, L"SFRT Reflections glassCompositePso #15");
+            list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        }
 
         if (dumpNow) {  // 0.2.62: copy the dump out of the glossy-sample buffer (it is rewritten every frame anyway)
             const D3D12_RESOURCE_BARRIER b = Transition(g_rad.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1570,6 +1862,8 @@ namespace rt
             const D3D12_RESOURCE_BARRIER b = Transition(g_glassBuf.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             list->ResourceBarrier(1, &b);
         }
+        if (dumpNow)  // 0.5.98: the crosshair ring (glass buffer is a copy source here)
+            list->CopyBufferRegion(g_glassDumpReadback.Get(), kGlassDumpBytes, g_glassBuf.Get(), camOff + 512, kGlassRingBytes);
         list->CopyTextureRegion(&tex, 0, 0, 0, &foot, nullptr);
         {
             const D3D12_RESOURCE_BARRIER b[2] = {
@@ -1578,6 +1872,18 @@ namespace rt
             };
             list->ResourceBarrier(2, b);
         }
+        {  // 0.5.70: this frame's camera rows (the GI capture right after this pass stores this frame's image)
+            std::uint64_t psOff = 0;
+            ID3D12Resource* ps = FindUploadBuffer(in.perScene, psOff);
+            g_glassHaveCam = ps && psOff + 272 <= ps->GetDesc().Width;
+            if (g_glassHaveCam) list->CopyBufferRegion(g_glassBuf.Get(), camOff, ps, psOff, 272);  // buffer is in COPY_DEST here
+        }
         return "applied";
     }
+}
+
+namespace rt
+{
+    // 0.5.126: see g_solidBits. 0 until the glass pass has run once.
+    D3D12_GPU_VIRTUAL_ADDRESS GlassSolidBits() { return g_solidBits ? g_solidBits->GetGPUVirtualAddress() : 0; }
 }

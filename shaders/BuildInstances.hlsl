@@ -20,7 +20,7 @@ RWByteAddressBuffer Counter   : register(u1);  // 0.2.2: active instance count (
 // near the camera, for the CPU to assign slots: [0] = count, entries at 16 + i * 16 = (instance, mesh, distance, 0).
 ByteAddressBuffer   SkinSlots : register(t6);
 RWByteAddressBuffer SkinCands : register(u2);
-static const uint kSkinCandidates = 256;
+static const uint kSkinCandidates = 2048;  // 0.5.119: was 256 (must match Blas.cpp)
 
 cbuffer Params : register(b0)
 {
@@ -38,12 +38,50 @@ cbuffer Params : register(b0)
     float CullDistance;  // 0.2.3: leave out instances whose nearest point is farther than this from the camera (0 = off)
     float SkinRadius;    // 0.2.32: skinned instances within this distance become candidates (0 = no skinned instances)
     uint  SkinSlotCount; // 0.2.32: slots in SkinSlots
+    float MinAngle;      // 0.6.0 work (0.5.100): leave out rigid objects whose bounding radius / distance is below this (0 = off)
+    uint  UseSolidBits;  // 0.5.126: 1 = SolidBits is bound
+    uint  UsePhantomBits;  // 0.5.134: 1 = PhantomBits is bound
 };
+// 0.5.134: 1 bit per record: objects the game doesn't draw (phantom detector in the sun pass).
+RWByteAddressBuffer PhantomBits : register(u4);
+// 0.5.126: 1 bit per record: glass-tagged objects the game draws as solid surfaces (from the glass pass's scores).
+RWByteAddressBuffer SolidBits : register(u3);
 
 cbuffer PerScene : register(b1) { float4 PerSceneRows[1]; };  // 0.2.3: row 0 = camera world position
 
 static const uint kTriangleCullDisable = 0x1;  // D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE
 static const uint kForceNonOpaque = 0x8;       // D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE
+
+// 0.5.102: duplicate check. Two hash tables after the near-camera dump in Counter: one keyed on place (position and
+// rotation), one on place + BLAS. Counts at kDupCounts: same mesh at the same place, and any mesh at a place already taken.
+static const uint kHashOff = 4096;
+static const uint kHashSlots = 1u << 19;  // per table
+static const uint kDupCounts = 4088;
+
+uint Pcg(uint v)
+{
+    const uint s = v * 747796405u + 2891336453u;
+    const uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+// Returns true when the key was already in the table.
+bool HashInsert(uint table, uint h)
+{
+    const uint key = Pcg(h ^ 0x9E3779B9u) | 1u;  // never 0 (empty)
+    uint i = h & (kHashSlots - 1u);
+    [loop] for (uint n = 0; n < 16u; ++n)
+    {
+        uint prev;
+        Counter.InterlockedCompareExchange(kHashOff + (table * kHashSlots + i) * 4u, 0u, key, prev);
+        if (prev == 0u)
+            return false;
+        if (prev == key)
+            return true;
+        i = (i + 1u) & (kHashSlots - 1u);
+    }
+    return false;
+}
 
 void WriteNull(uint slot)
 {
@@ -60,9 +98,16 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint id = tid.x;
     if (Pass == 0)
     {
+        if (id < 2u * kHashSlots)
+            Counter.Store(kHashOff + id * 4u, 0u);  // 0.5.102
         if (id == 0)
         {
-            Counter.Store3(0, uint3(0u, 0u, 0u));  // active count, glass count (0.2.44), player instances (0.2.67)
+            Counter.Store4(0, uint4(0u, 0u, 0u, 0u));  // active count, glass count (0.2.44), player instances (0.2.67), size-culled (0.5.100)
+            Counter.Store(16, 0u);                  // 0.5.66: near-camera dump count
+            Counter.Store3(20, uint3(0u, 0u, 0u));  // 0.5.101: breakdown counters 20..63
+            Counter.Store4(32, uint4(0u, 0u, 0u, 0u));
+            Counter.Store4(48, uint4(0u, 0u, 0u, 0u));
+            Counter.Store2(kDupCounts, uint2(0u, 0u));
             SkinCands.Store(0, 0u);
         }
         return;
@@ -85,6 +130,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float k = 0;
     bool glass = false;   // 0.2.44
     bool effect = false;  // 0.2.64
+    bool glowCard = false, screen = false;  // 0.5.121
     uint flags = kTriangleCullDisable;
     uint hitGroup = 0;  // 0.2.67: 1 = the player's own (first-person) body: rays ignore it within kHeadRadius of the camera
     if (valid)
@@ -146,6 +192,14 @@ void main(uint3 tid : SV_DispatchThreadID)
                         const bool drawnSkinned = (Lods.Load(id * 80 + 8) & 0x40000000u) != 0;
                         if (!drawnSkinned && abs(q.x) + abs(q.y) > 0.03f && length(rel) < 6.0f)
                             valid = false;
+                        // 0.5.65: ...and in first person that tilted rig IS drawn: the arms you see. It is anchored away
+                        // from "right under the camera", so the 0.2.67 test missed it and the arms showed in reflections.
+                        // NPCs stand upright (yaw only), so a drawn tilted rig this close is the player's.
+                        if (drawnSkinned && abs(q.x) + abs(q.y) > 0.03f && length(rel) < 2.5f)
+                        {
+                            flags |= kForceNonOpaque;
+                            hitGroup = 1;
+                        }
                         break;
                     }
                 }
@@ -160,9 +214,42 @@ void main(uint3 tid : SV_DispatchThreadID)
             k = s * meshScale * 32767.0f * (((handle >> 30) & 1u) ? 2.0f : 1.0f);
             // |SNORM| <= 1, so k bounds the instance's half-extent in world units.
             valid = (blas.x | blas.y) != 0 && k > 0.0f && k <= MaxExtent;
+            // 0.5.65: the first-person weapon (rigid, not skinned) showed in reflections. 0.5.68: the near-camera probe
+            // showed it is ~50 records (63136..63185 in Neon) right next to the player's own skinned records
+            // (63159..63165), and that some parts have a size bound of 2 or 10 m (the bound is loose), so 0.5.65's
+            // "under 1.5 m" rule missed them. Now: a rigid object within 1.5 m of the camera whose record index is
+            // within 64 of a skinned copy that stands where the player does (same test as 0.2.67). Walls and props are
+            // thousands of records away from the player. In third person the camera is metres behind the character,
+            // so the test fails and the weapon stays in. Tagged as the player (hit group 1): reflection, GI and glass
+            // rays skip it, as do sun and lamp shadows (no first-person shadows, 0.5.49).
+            if (valid && SkinRadius > 0.0f && length(t - PerSceneRows[0].xyz) < 1.5f)  // SkinRadius > 0: camera bound
+            {
+                for (uint i = 0; i < SkinSlotCount; ++i)
+                {
+                    const uint sid = SkinSlots.Load(i * 4);
+                    if (sid >= InstanceRecords || (sid > id ? sid - id : id - sid) > 64u)
+                        continue;
+                    const float3 srel = PerSceneRows[0].xyz - asfloat(Instances.Load3(sid * 96 + 32));
+                    if (length(srel.xy) < 1.2f && srel.z > -0.6f && srel.z < 2.5f)
+                    {
+                        flags |= kForceNonOpaque;
+                        hitGroup = 1;
+                        break;
+                    }
+                }
+            }
             // 0.2.3: distance culling (k bounds the half-extent; sqrt(3) k covers the box corners).
             if (CullDistance > 0.0f && length(t - PerSceneRows[0].xyz) - k * 1.7320508f > CullDistance)
                 valid = false;
+            // 0.5.100: size on screen. Outside on the Neon walkways the scene went from 65k to 275k objects (4 km range),
+            // most of them small clutter far away covering a pixel or two: the frame time went from 17 to 61 ms. An
+            // object whose bounding radius / distance is below MinAngle (about 3-8 px at 1440p) is left out. Buildings
+            // and large props stay in to the full range.
+            if (valid && MinAngle > 0.0f && hitGroup == 0u && k * 1.7320508f < MinAngle * length(t - PerSceneRows[0].xyz))
+            {
+                valid = false;
+                Counter.InterlockedAdd(12, 1u);
+            }
             // 0.1.23: alpha-tested materials (leaves, grass, fences) go through the any-hit path.
             const uint bucket = Lods.Load(id * 4 * 20);
             const uint material = (bucket >> 13) & 0x7FFFu, type = bucket & 0x1Fu;
@@ -176,6 +263,11 @@ void main(uint3 tid : SV_DispatchThreadID)
             // 0.2.64: LOD dword 0 = material 0, the game's blank default entry: smoke sheets, haze volumes and other effect
             // meshes (F8 dump in Neon). Not glass: they get their own mask 0x04, which no reflection or glass ray traces.
             effect = (AlphaTest & 2u) && bucket == 0u;
+            // 0.5.121: glowing cards and screens. Probe on the Jemison/MAST walkway: a long hard sun shadow came from two
+            // invisible 16 m panels 0.4 m above the floor: instance 180 (standard material with emission, not drawn as a
+            // solid surface: a light-shaft / hologram card) and instance 173 (family 7, the screen/hologram family).
+            glowCard = glass && Materials.Load(material * 288 + 16) != 0u;  // emission flags set
+            screen = (AlphaTest & 2u) && type == 7u;
         }
     }
 
@@ -187,8 +279,34 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     // 0.2.2: only active instances get a descriptor, packed to the front. InstanceID keeps the record
     // index (the shadow and probe shaders read the game's records through it).
+    // 0.5.66: every record whose origin is within 1.5 m of the camera (0.5.67: was 3 m, which filled the list with walls), for the Numpad . probe (the first-person gun still
+    // showed in reflections in 0.5.65). 64 B at Counter + 64 + 64 i, at most 48: record, bones, mesh, packed
+    // (flags | hit group << 8 | valid << 16 | drawn-skinned << 17 | glass << 18 | effect << 19), k, distance,
+    // camera - origin (xyz), quaternion (xyzw).
+    if (id < InstanceRecords && SkinRadius > 0.0f && all(isfinite(t)) && length(t - PerSceneRows[0].xyz) < 1.5f)
+    {
+        uint n;
+        Counter.InterlockedAdd(16, 1u, n);
+        if (n < 48u)
+        {
+            const uint o = 64 + n * 64;
+            const uint drawnBit = (Lods.Load(id * 80 + 8) & 0x40000000u) != 0 ? 1u : 0u;
+            Counter.Store4(o, uint4(id, Instances.Load(id * 96 + 4) >> 24, Lods.Load(id * 80 + 4),
+                (flags & 0xFFu) | (hitGroup << 8) | ((valid ? 1u : 0u) << 16) | (drawnBit << 17) | ((glass ? 1u : 0u) << 18) |
+                ((effect ? 1u : 0u) << 19)));
+            const float3 rel = PerSceneRows[0].xyz - t;
+            Counter.Store4(o + 16, asuint(float4(k, length(rel), rel.x, rel.y)));
+            Counter.Store4(o + 32, asuint(float4(rel.z, q.x, q.y, q.z)));
+            Counter.Store(o + 48, asuint(q.w));
+        }
+    }
     if (!valid)
         return;
+    // 0.5.132: hit group 3 = a giant rigid object (over 150 m across): the city's distant-detail blocks (a 512 m block
+    // at round coordinates under Jemison, never drawn up close). Sun rays pass their back faces at any distance: up
+    // close, our copy of such a block sits up to 0.4 m off the real floor and shadowed it in big curved patches.
+    if (hitGroup == 0u && k * 1.7320508f > 150.0f)
+        hitGroup = 3u;
     uint slot;
     Counter.InterlockedAdd(0, 1u, slot);
     if (slot >= Limit)
@@ -197,11 +315,48 @@ void main(uint3 tid : SV_DispatchThreadID)
     Out.Store4(o + 0, asuint(float4(r0 * k, t.x)));
     Out.Store4(o + 16, asuint(float4(r1 * k, t.y)));
     Out.Store4(o + 32, asuint(float4(r2 * k, t.z)));
-    if (glass && !effect)
+    if (glass && !effect && !glowCard)
         Counter.InterlockedAdd(4, 1u);
+    // 0.5.101: breakdown of what stays in (the 0.5.100 size cut left 265k of 269k on the Neon walkways). Distance from
+    // the camera to the origin (m): < 50, < 200, < 1000, more. Bounding radius k (m): < 0.5, < 2, < 10, more. Then
+    // alpha-tested (any-hit), effect meshes and characters.
+    {
+        const float d = length(t - PerSceneRows[0].xyz);
+        Counter.InterlockedAdd(d < 50.0f ? 20 : d < 200.0f ? 24 : d < 1000.0f ? 28 : 32, 1u);
+        Counter.InterlockedAdd(k < 0.5f ? 36 : k < 2.0f ? 40 : k < 10.0f ? 44 : 48, 1u);
+        if (flags & kForceNonOpaque)
+            Counter.InterlockedAdd(52, 1u);
+        if (effect || glowCard)
+            Counter.InterlockedAdd(56, 1u);  // 0.5.121: + glowing cards
+        if (hitGroup == 2u)
+            Counter.InterlockedAdd(60, 1u);
+        // 0.5.102: position to 1 cm, rotation to 1/1000.
+        const int3 tp = int3(round(t * 100.0f));
+        const int4 qp = int4(round(q * 1000.0f));
+        uint h = Pcg(asuint(tp.x));
+        h = Pcg(h ^ asuint(tp.y)); h = Pcg(h ^ asuint(tp.z));
+        h = Pcg(h ^ asuint(qp.x)); h = Pcg(h ^ asuint(qp.y)); h = Pcg(h ^ asuint(qp.z)); h = Pcg(h ^ asuint(qp.w));
+        h = Pcg(h ^ asuint(int(round(k * 1000.0f))));
+        const bool samePlace = HashInsert(0u, h);
+        const bool sameMesh = HashInsert(1u, Pcg(Pcg(h ^ blas.x) ^ blas.y));
+        if (sameMesh)
+            Counter.InterlockedAdd(kDupCounts, 1u);
+        if (samePlace)
+            Counter.InterlockedAdd(kDupCounts + 4u, 1u);
+    }
     if (hitGroup == 1u)
         Counter.InterlockedAdd(8, 1u);
-    const uint mask = (AlphaTest & 2u) ? (effect ? 0x04u : glass ? 0x02u : 0x01u) : 0xFFu;  // 0.2.44, 0.2.64 effects
+    // 0.5.121: 0x10 = glowing card (traced by nothing: invisible in the game), 0x08 = family 7 screen (reflections, GI and
+    // glass reflections only: no sun or lamp shadows).
+    // 0.5.126: a glass-tagged object the game draws solid (Jemison Mercantile wall panel, material flags 0x12 like a window
+    // pane) also gets the solid mask: reflection rays went through it and picked up the far hall or the game's cubemap.
+    // It keeps the glass bit, so the glass pass goes on scoring it.
+    const bool drawnSolid = glass && UseSolidBits != 0u && id < (1u << 19) && ((SolidBits.Load((id >> 5) * 4u) >> (id & 31u)) & 1u) != 0u;
+    // 0.5.134: an object the game doesn't draw (phantom bit) gets mask 0x10: no shadow, reflection or GI ray traces it,
+    // only the sun pass's phantom detector (mask 0x11), which clears the bit once the game draws it again.
+    const bool phantom = UsePhantomBits != 0u && (hitGroup == 0u || hitGroup == 3u) && id < (1u << 19) &&
+                         ((PhantomBits.Load((id >> 5) * 4u) >> (id & 31u)) & 1u) != 0u;
+    const uint mask = (AlphaTest & 2u) ? (effect ? 0x04u : glowCard ? 0x10u : phantom ? 0x10u : drawnSolid ? 0x03u : glass ? 0x02u : screen ? 0x08u : 0x01u) : 0xFFu;  // 0.2.44, 0.2.64 effects
     Out.Store(o + 48, (id & 0xFFFFFFu) | (mask << 24));  // InstanceID = record index | InstanceMask
     Out.Store(o + 52, hitGroup | (flags << 24));          // hit group offset (0.2.67: 1 = player) | flags
     Out.Store2(o + 56, blas);

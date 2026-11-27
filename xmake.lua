@@ -1,6 +1,6 @@
-﻿set_xmakever("3.0.0")
+set_xmakever("3.0.0")
 set_project("StarfieldRT")
-set_version("0.5.60")
+set_version("0.5.136")
 set_arch("x64")
 set_languages("c++23")
 add_rules("mode.release")

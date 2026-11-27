@@ -1,12 +1,13 @@
 ScriptName SFRT_OptionsQuest extends Quest
-{Starfield RT (0.2.36): copies the Gameplay Options choices into globals that the SFSE plugin reads every frame.}
+{Starfield RT: copies the Gameplay Options choices into globals that the SFSE plugin reads every 30 frames.
+0.5.92: Ray Tracing On / Off. 0.5.94: + Ray Tracing Quality (Low / Medium / High / Ultra).}
 
-GameplayOption Property SFRT_GPO_Reflections Auto Const Mandatory
-{RT Reflections: 0 off, 1 low, 2 medium, 3 high, 4 ultra}
-GameplayOption Property SFRT_GPO_Shadows Auto Const Mandatory
-{RT Shadows: 0 off, 1 low, 2 medium, 3 high, 4 ultra}
-GlobalVariable Property SFRT_ReflectionQuality Auto Const Mandatory
-GlobalVariable Property SFRT_ShadowQuality Auto Const Mandatory
+GameplayOption Property SFRT_GPO_RayTracing Auto Const Mandatory
+{Ray Tracing: 0 off, 1 on}
+GlobalVariable Property SFRT_RayTracing Auto Const Mandatory
+GameplayOption Property SFRT_GPO_RTQuality Auto Const Mandatory
+{Ray Tracing Quality: 1 low, 2 medium, 3 high, 4 ultra}
+GlobalVariable Property SFRT_RTQuality Auto Const Mandatory
 
 Event OnQuestInit()
     Setup()
@@ -28,6 +29,6 @@ Function Setup()
 EndFunction
 
 Function Sync()
-    SFRT_ReflectionQuality.SetValue(SFRT_GPO_Reflections.GetValue())
-    SFRT_ShadowQuality.SetValue(SFRT_GPO_Shadows.GetValue())
+    SFRT_RayTracing.SetValue(SFRT_GPO_RayTracing.GetValue())
+    SFRT_RTQuality.SetValue(SFRT_GPO_RTQuality.GetValue())
 EndFunction

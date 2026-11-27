@@ -12,6 +12,8 @@ $jobs = @(
     @("cs_6_6", "main",         "g_RtReflectDebugCS",    "RtReflectDebugCS",    "RtReflectDebug"),
     @("cs_6_6", "Resolve",      "g_RtReflectResolveCS",  "RtReflectResolveCS",  "RtReflectDebug"),
     @("cs_6_6", "Glass",        "g_RtGlassCS",           "RtGlassCS",           "RtReflectDebug"),
+    @("cs_6_6", "GlassScoreUpdate", "g_RtGlassScoreCS",  "RtGlassScoreCS",      "RtReflectDebug"),
+    @("cs_6_6", "GlassComposite", "g_RtGlassCompositeCS", "RtGlassCompositeCS", "RtReflectDebug"),
     @("cs_6_6", "GiTrace",      "g_RtGiTraceCS",         "RtGiTraceCS",         "RtReflectDebug"),
     @("cs_6_6", "GiTemporal",   "g_RtGiTemporalCS",      "RtGiTemporalCS",      "RtReflectDebug"),
     @("cs_6_6", "GiResolve",    "g_RtGiResolveCS",       "RtGiResolveCS",       "RtReflectDebug"),

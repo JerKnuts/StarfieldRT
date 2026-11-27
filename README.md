@@ -1,8 +1,8 @@
-﻿# Starfield RT 0.5.60
+# Starfield RT 0.5.136
 
 An SFSE plugin that adds ray-traced **lighting (GI), shadows and reflections** to Starfield on DXR 1.1+ GPUs.
 
-> **Status: Phase 1 (RT sun shadows) and Phase 2 (RT reflections) work; 0.4.0 ray-traces every lamp with shadows (Numpad 2 compares with the game's lamps). Now: Phase 3, ray-traced GI (0.3.0, being tested: one ray per 2x2 pixels, lit by the sun and the game's lamps, accumulated over time; Numpad 1 cycles on / debug / off; starts intense, `fGIStrength`).** Reflections: glossy RT reflections on by default, lit by the game's own lamps (Numpad 5), with RT reflections on thin glass (Numpad 4 cycles on / stage debug / off). Numpad 0 cycles reflections off / on / debug views. **All keys are on the numpad (NumLock on); the key map is at the top of StarfieldRT.ini.** Every hotkey shows what it switched as a HUD message (`bOnScreenMessages`).
+> **Status: Phase 1 (RT sun shadows) and Phase 2 (RT reflections) work; 0.4.0 ray-traces every lamp with shadows (Numpad 2 compares with the game's lamps). Now: Phase 3, ray-traced GI (0.3.0, being tested: one ray per 2x2 pixels, lit by the sun and the game's lamps, accumulated over time; Numpad 1 cycles on / debug / off; starts intense, `fGIStrength`).** Reflections: glossy RT reflections on by default, lit by the game's own lamps (Numpad 5), with RT reflections on thin glass (Numpad 4 cycles on / stage debug / off). Thin glass only runs while RT reflections are on (Numpad 0). Since 0.5.61 thin glass has a smoke filter (Alt+Numpad 4, `bThinGlassSmokeFilter`): only objects the game really draws as glass reflect, so drifting smoke no longer switches reflections on and off. Numpad 0 cycles reflections off / on / debug views. **F8 switches every RT effect off and back on (0.5.77). The other keys are on the numpad (NumLock on); the key map is at the top of StarfieldRT.ini.** Every hotkey shows what it switched as a HUD message (`bOnScreenMessages`).
 
 ## What works today
 
@@ -21,7 +21,7 @@ An SFSE plugin that adds ray-traced **lighting (GI), shadows and reflections** t
 
 `StarfieldRT.ini` sits next to the DLL in `SFSE\Plugins`.
 
-**In game (0.2.36):** Settings > Gameplay Options > **Starfield RT** has **RT Reflections** and **RT Shadows** (Off / Low / Medium / High / Ultra), applied live and saved with the game. They need `StarfieldRT.esm` enabled, and they override `iReflectionQuality` / `iShadowQuality` unless those are `-1` (custom).
+**In game (0.5.94):** Settings > Gameplay Options > **Starfield RT** has **Ray Tracing** (On / Off, default On; Off is the same as F8) and **Ray Tracing Quality** (Low / Medium / High / Ultra, default High). Both apply live and are saved with the game, and they need `StarfieldRT.esm` enabled. The game can't grey an option out, so the quality selector stays visible while Ray Tracing is Off but has no effect until it is turned back on. The menu quality overrides `iReflectionQuality` / `iShadowQuality` unless those are `-1` (custom). Per-effect settings are planned for 1.0.
 
 | Setting | Values | Purpose |
 |---|---|---|

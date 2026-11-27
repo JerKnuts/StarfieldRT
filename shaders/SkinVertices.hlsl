@@ -63,7 +63,11 @@ void main(uint3 tid : SV_DispatchThreadID)
     const uint so = Slot * 32;
     const uint4 st = SlotState.Load4(so + 12);  // frames unchanged, instance id
     const float3 t = asfloat(Instances.Load3(Instance * 96 + 32));
-    const bool frozen = st.y == Instance && st.x >= kFrozenFrames && length(t - PerSceneRows[0].xyz) < kFrozenRadius;
+    // 0.5.120: never a body the game skinned this frame (LOD +8 bit 30): the game only skins what it draws, and the
+    // player's unused body never has the bit (RT_FINDINGS). Mannequins are drawn but never move, so while NPCs walked
+    // around them they were collapsed after 60 frames: no mannequin in reflections or shadows (soak test, Neon).
+    const bool gameSkinned = (Lods.Load(Instance * 80 + 8) & 0x40000000u) != 0;
+    const bool frozen = !gameSkinned && st.y == Instance && st.x >= kFrozenFrames && length(t - PerSceneRows[0].xyz) < kFrozenRadius;
     if (Dump != 0 && v < 44)  // 0.5.53: instance record (24 dwords) then LOD record (20 dwords)
     {
         const uint src = v < 24 ? Instances.Load(Instance * 96 + v * 4) : Lods.Load(Instance * 80 + (v - 24) * 4);

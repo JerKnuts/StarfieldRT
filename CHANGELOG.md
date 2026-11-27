@@ -1,6 +1,714 @@
-﻿# Changelog
+# Changelog
 
 Newest first. `1.0.0` is launch, `0.B.0` marks big milestones, and every other update bumps the last number.
+
+## 0.5.136 - 2026-11-26
+
+- **Fixed: no RT sun shadows at all since 0.5.134.** The phantom detector added a binding to the sun-shadow root signature, but the parameter count passed to D3D12 stayed 12, so the sun-shadow pipeline failed to build (log: `sun shadows ...: skipped: pipeline unavailable`). That's a big part of "nothing dark anymore", and why the trash-bin shadow was gone in 0.5.134 (not the phantom fix: as suspected, coincidence). The phantom detector itself never ran either, so it is untested.
+- **New: lamp shadows at the points GI rays hit** (`iGILampShadowRays`, default 2). Probe behind a post standing at a wall: the lamps at the pixel were correctly shadowed and 13 of 15 GI rays hit the wall within 8-34 cm, but each hit was lit by the lamps with no shadow test (`iHitLampShadowRays=0`, chosen for reflections because of noise). So the hidden wall behind the post was lit as if it faced the lamps and bounced that light into the gap. Now the 2 strongest lamps at each GI hit get a shadow ray. GI is smoothed over frames, so the extra noise is small. Reflections are unchanged.
+- **0.5.135 result:** the gap behind the post was still lit. Tram ride: F8 (all RT off) fixes the darkness, so it is caused by RT; which effect is not known yet.
+- **To check:** sun shadows are back (outdoors in daylight, and the trash-bin spot: is the phantom shadow back, or does the phantom detector remove it now?). Gaps behind objects at walls should be darker. GI cost may rise a little (PERF GI line).
+
+## 0.5.135 - 2026-11-26
+
+- **Changed: RT GI respects the material's ambient occlusion** (tester: "there's nothing dark anymore, some things need more shadows", e.g. behind objects).
+  - Our GI replaces the game's indirect (bounce) light. The game's version is multiplied by the material's baked ambient occlusion (G-buffer t2.x: creases, gaps, contact areas); ours wasn't. At one ray per 2x2 pixels and with a wide blur, our own traced occlusion smooths out, so those areas were lit like open surfaces.
+  - Now our GI light is multiplied by that AO too. The game's screen-space AO is still applied on top of it by the game's composite pass, as before.
+- **0.5.134 results:** the trash-bin shadow was gone (could be coincidence). The tram ride still went dark. Reflection strength 1.0 (0.5.133) is good: keep it.
+- **To check:** corners, the floor under and behind furniture, gaps between objects: they should be darker than in 0.5.134, while open surfaces look the same. Numpad 1 switches GI off for comparison.
+
+## 0.5.134 - 2026-11-26
+
+- **New: objects the game doesn't draw no longer cast RT shadows or show in RT reflections** (tester: a "random shadow" beside an upright trash bin in Jemison, probed 3 times).
+  - Probes: two invisible parts (instances 108656 and 108657, 78 and 134 triangles) stood 0.5 m above the floor at the centre of the shadow. Camera rays hit them well in front of the floor the game shows, and their record changed slightly every frame (a settling physics object), but the game drew nothing there. The MAST floor probe had the same kind of object (instance 87592).
+  - The sun pass now checks this all the time: on 1 pixel in 16 per frame (rotating), a camera ray is compared with the game's depth. A hit clearly in front of what the game shows (more than 10% + 0.25 m nearer) is a "phantom" sample for that object; a hit where the game shows it is a "drawn" sample. After 16 phantom samples in a row, the object gets mask 0x10: no shadow, reflection or GI ray traces it any more, only the check itself, so one drawn sample brings it back. Characters and the player are never marked. Only up to 120 m.
+  - New ini setting `bPhantomDetect` (default 1).
+- **0.5.133 not tested yet** (built while the game was running); this build includes it.
+- **To check:** the trash-bin spot in the Jemison station: the shadow should disappear within a second or two of looking at it. Shadows from real objects must stay: furniture, rails, trees and leaves, people. Also watch for shadows of real objects flickering on and off.
+
+## 0.5.133 - 2026-11-26
+
+- **Fixed (likely): the scene going dark during the tram ride.** The game's cubemaps are now hidden only while RT is fully running: not during a load or while RT fades back in afterwards. The tram ride is a load (13-25 s in the log). RT reflections and GI pause during loads, and with the probes blanked as well, interiors had no reflection and lost light. 0.5.131 (GatherIndirect keeps its probes) wasn't enough.
+- **Changed: reflections twice as strong by default.** `fReflectionStrength` 0.5 -> 1.0 (1 = physically based; tester: "I would like to see more reflections"). Live: Ctrl+Numpad * stronger, Ctrl+Numpad / weaker (0.1 per press, 0.5 to 3); Ctrl+Numpad + glossier, Ctrl+Numpad - softer. The value shows on screen; put the one you like in the ini.
+- **0.5.132 result:** the curved floor shadow in the Jemison station was gone (could be coincidence). The tram still went dark during the ride.
+- **To check:** ride the tram (no dark scene), and look at floors and panels with the stronger reflections.
+
+## 0.5.132 - 2026-11-26
+
+- **Fixed (likely): big curved sun-shadow patches on floors in Jemison** (tester: "weird shadow" on the station floor; probably also blocker 10, the MAST floor shadow, and maybe 9).
+  - Probe: all 144 grid samples were sun-blocked by the same object, instance 32824, a 512 m solid mesh at round coordinates (-700, 1700, -239), never drawn on screen: one of the city's distant-detail blocks. The sun rays hit it 0.1-0.4 m above the real floor, mostly on its back faces (139 of 142). Up close our copy of that block lies just off the real floor, and its edge is the curved shadow line.
+  - Since 0.5.55 a back-face hit is passed only within 0.1 m + 2% of the view distance of the ray start (0.14 m here), so this got through.
+  - Now objects over 150 m across are tagged (hit group 3), and sun rays pass their back faces at any distance. Seeing the back of a 500 m block means you are inside or under its low-detail shell, which isn't really there. Front faces still cast shadows, and ordinary buildings and ceilings are unchanged.
+- Includes 0.5.131 (built but not installed before this).
+- **To check:** the Jemison station floor and the MAST Defense floor (no big dark patches; real shadows from desks, rails and people stay). Also outdoors in daylight: distant buildings should still cast shadows, and no sunlight should leak into large enclosed spaces.
+
+## 0.5.131 - 2026-11-26
+
+- **Fixed (likely): everything very dark after riding the Jemison tram with 0.5.130.** GatherIndirect, the lighting pass whose probe reflection RT already replaces, keeps the game's reflection probes again. Every other pass still sees them blanked.
+  - Suspected cause: the 0.5.129 survey area showed GatherIndirect binding only a single 256 px cube, not the probe array, but in other areas it seems to read the probe array, and its ambient (diffuse) light uses it too. With the array blanked, interiors lost their ambient light. The tram ride is a load into another area, which matches.
+  - Its reflection output is still replaced by RT, so no cubemap reflection comes back from this.
+- **0.5.130 result:** sign panels without cubemaps, confirmed; nothing too dark in that area. After the tram ride, the station was very dark.
+- **To check:** ride the tram again. The station and the tram interior should have their normal ambient light. The sign panels should stay free of cubemaps. If it is still dark, toggle RT reflections with Numpad 0 there (off brings the game's probes back) and say whether the light returns.
+
+## 0.5.130 - 2026-11-26
+
+- **Fixed: the game's cubemap reflections are hidden everywhere while RT reflections are on** (tester: glossy sign panels showed a cubemap image, "a mix of cubemaps and RT reflections"; "apply it all around").
+  - The 0.5.129 cube survey: the lighting pass we replace (GatherIndirect) no longer binds the game's reflection-probe array (it binds a single 256 px cube). The probe array (198 slices, 7 mips) is bound by about 15 other table sets, graphics and compute, most of them in passes we don't hook, plus the forward and OIT passes. One of those applies the probe reflection on the panels.
+  - So instead of chasing passes: whenever the game writes or copies a view of that probe array into the shader-visible heap, the plugin immediately overwrites it with a view of a black cube array. Every pass then sees black probes, so no game cubemap reflection is added anywhere. RT reflections are the only reflections.
+  - Only while RT reflections are on (Numpad 0 = on). Switching them off gives the game's cubemaps back from the next frame. New ini setting `bHideGameCubemaps` (default 1).
+  - The probe array is the one the glass pass binds (found by the 0.2.39 glass code), so it is registered the first time glass is drawn after loading.
+- **0.5.129 result:** the survey found the probe array in about 15 places, mostly unhooked passes (log `[cubes]`).
+- **To check:**
+  - The Jemison sign panels (Oishii, Mercantile): no dark-hall image; only the RT reflection of what is behind you.
+  - Nothing goes too dark: shiny floors, metals, glass, water and characters (the probes may also feed some ambient light). Compare by switching reflections off with Numpad 0.
+  - Switch RT reflections off and on again: the game's cubemaps should come back when off.
+- **0.5.130 result:** the tester confirmed the cubemaps are gone. The probe array was registered as soon as glass was drawn after loading; no warnings, no GPU errors.
+
+## 0.5.129 - 2026-11-26
+
+- **New (diagnostic): cube survey.** For 3 frames after a Numpad . probe, every descriptor table the game binds is scanned for cubemap views, and each pass, root slot and table entry that holds one is logged once (`[cubes]` lines). No change to the image.
+  - Why: the glossy sign panels in Jemison still show a cubemap reflection (a dark ring hall that isn't there) with RT reflections on. Screenshots: the same image with RT reflections on and off; the coverage view all green (our pass replaces the lighting pass's probe reflection there); the RT colour view shows the real bright room behind the player. So another game pass applies reflection probes, most likely the tiled lighting with local probes. The survey finds it so the next build can blank its cubemap, the way 0.2.39 does for glass.
+- **0.5.128 result:** at the crosshair the panel's reflection is fully ray traced now (hit at 3.9 m, our shading, no cubemap floor).
+- **To check:** stand in front of one of the sign panels and press Numpad . once. Send the log.
+
+## 0.5.128 - 2026-11-26
+
+- **Fixed: the game's cubemap mixed into RT reflections on glossy panels** (tester: the Oishii and Mercantile sign boxes showed "a mix of cubemaps and RT reflections").
+  - Probe: the reflection ray hit a real object 4.1 m behind the player, and our shading was a dark red (0.48, 0.06, 0.07 HDR); the value used was the cubemap's grey (0.54, 0.62, 0.52).
+  - Cause: since 0.5.32, an off-screen reflection hit is never darker than the game's cubemap in that direction, per colour channel. It was added for metals (copper columns, The Viewport's facade went near-black). On glossy non-metals it pasted the cubemap over the real reflection.
+  - Now the floor applies to metals only (none below metalness 0.3, full from 0.7). Non-metal reflections are purely ray traced. Ctrl+Numpad 5 still switches the floor off entirely.
+- **To check:** the sign boxes in Jemison (Oishii, Mercantile): the reflection should show what is really behind you, without the cubemap's shapes. Also metal surfaces (copper columns, The Viewport) should not go black.
+
+## 0.5.127 - 2026-11-26
+
+- **Fixed: 0.5.126 could never mark the Mercantile panel as solid** (found before testing). The glass pass's camera ray stops just short of the visible surface, so a glass-tagged object that *is* the visible surface was never sampled, and its score never moved. On the glass pass's statistics pixels (1 in 16 per frame) that no see-through glass covers, a short ray now looks for a glass-tagged object right at the visible surface; one found there counts as a sample drawn solid. Real panes aren't in the depth buffer, so they aren't found this way.
+- **To check:** as for 0.5.126.
+
+## 0.5.126 - 2026-11-26
+
+- **Fixed: reflections passing through solid panels the game's material flags mark like windows** (tester: a glossy Jemison Mercantile board showed "a bunch of stuff that is not there" from behind the player).
+  - Probes: the panel behind the player (instance 42018, material 563) is a solid surface in the game's image (G-buffer, roughness 0.31, 1.7 m away), and its own reflection ray hits the board. But the board's reflection rays went straight through it: they hit things 15-40 m away, or nothing (then the game's cubemap, a picture taken somewhere else). The reflection-source view showed the board almost all red (traced, off screen) and blue (cubemap).
+  - Cause: material 563 has flags 0x12 at +108, the same value as real window panes. Since 0.2.44 that puts an object in the glass group, which reflection rays skip.
+  - Fix: the glass pass already scores, per object, how much of it the game draws see-through (real panes about 1). An object it finds drawn solid (score and this frame's samples both under 0.15) now goes into the solid group as well as the glass group, so reflection rays hit it and the glass pass keeps checking it. A new pane is never marked (its samples are see-through from the start). It takes the glass pass about a second of looking at the object to learn it.
+- **0.5.125 result:** the railing squares are reflections of the street lamps at about their real brightness; kept as they are.
+- **To check:** the Jemison Mercantile board (look at it, and at the wall behind you, for a second or two). Its reflection should show the panel behind you, not the far hall or the cubemap. Also check that real windows still reflect and still let you see through them, and that nothing became an invisible wall for shadows.
+
+## 0.5.125 - 2026-11-26
+
+- **New (diagnostic): the glass probe shows what our shading of a reflection hit is made of:** the hit's albedo, its emission, the light from the game's lamps, and ambient + sun. No change to the image.
+  - Why: three probes of the bright squares in the railing glass (0.5.124) all show the glass reflection ray hitting the same kind of object (family 0, material 662, instances 34201 and 34162) off screen. We shade it at HDR 6-7.5, while the glass pixel on screen is 0.01-0.02. The 0.5.122 emission fix was active, so the extra light comes from somewhere else.
+  - The street-lamp probe points the same way: the lamp itself really is bright (HDR 18 on screen), but the reflection ray from it hit an off-screen surface next to it (material 485) that we shade at HDR about 9 where the game's probe says 1.5. Suspect: surfaces right next to a bright lamp get its full light in our hit shading (no shadow ray there, and the lamp's falloff is at its maximum).
+- **0.5.124 results:** no hang in this session (TLAS allocated once for 262,144 objects at load, never again).
+- **To check:** probe one of the railing squares again (Numpad . on a square in the glass) and send the log. The `our shading:` line says which part is too bright.
+- **0.5.125 result:** the squares are the street lamps across from the railing, reflected at about their real brightness (our 5-6.6 vs the game's ~4.8 for the same panel at that exposure). Not a bug. The tester chose to keep them as they are.
+
+## 0.5.124 - 2026-11-26
+
+- **Fixed (likely): Frame Generation GPU hang when opening a menu or shortly after.** The ray-tracing scene's top-level buffers (TLAS) are now allocated for 262,144 objects from the start (about 120 MB, 60 MB more than before), so they are no longer swapped for bigger ones in the middle of play.
+  - 0.5.123 hung 5 s after pressing Tab (20:49:37). The new labels showed none of our passes running: only Frame Generation's pacer list and a DXGI list were waiting, the usual FG signature.
+  - In both 0.5.122/0.5.123 hangs, the log shows the TLAS buffers growing from 131,072 to 196,608 objects (about 90 MB of new buffers) 4-5 s before the hang: once as the menu opened, once 11 s after a menu closed. The scene had about 90,000 objects; with 25% headroom, the menu pushed the request past 131,072. Earlier FG hangs during loads (0.2.22, 0.2.29) also followed TLAS reallocations.
+  - If the buffers ever grow anyway, the log line now says what was asked for and how many objects were active.
+- **To check:** with Frame Generation on, run around and open menus (Tab, map, inventory) many times, including right after probing. No hang. VRAM use should be about 60 MB higher.
+
+## 0.5.123 - 2026-11-26
+
+- **New: GPU hang reports name the plugin pass the GPU froze in.** A marker goes before each of our 27 dispatches and acceleration-structure builds, and the crash report (DRED 1.2) now prints, for each unfinished command list, the ops by name, the last plugin label before the stop, and every plugin label in that list. No change to the image.
+  - Why: 0.5.122 hung on the way to the Jemison tram (20:38:37), 14 s after Ray Reconstruction came back on viewport 2 after a 55 s menu. Unlike the earlier Frame Generation hangs, no FG pacer list was unfinished: one unnamed list had stopped on a dispatch (541 of 838 ops) and everything else waited behind it. Our passes record into the game's own unnamed lists, so the old report couldn't say whether that dispatch was ours.
+  - The previous 0.5.122 hang (2026-11-25) also came about 19 s after the main view moved to viewport 2.
+- **0.5.122 results:** staying in a menu for 30-60 s with Frame Generation on: no hang. The bright squares in the railing glass at night are still there with the emission fix active (`iEmissiveModel=1`), so they come from something else.
+- **To check:** play normally with FG on. If it hangs, send the log: the `DRED ... last label before the stop` line names the pass. Also probe the railing squares (Numpad . on a square in the glass).
+
+## 0.5.122 - 2026-11-25
+
+- **Fixed (likely): glowing materials far too bright in reflections and GI when off screen** (tester: a grid of bright squares in a railing's thin glass at night, from nothing visible).
+  - The glass probe: the reflection ray hit instance 33788 (standard material 149) off screen, and our shading made it HDR 13.9 where the image at that spot was 0.13.
+  - Emission used the "adaptive" model: 2^(exposure offset) at a fixed on-screen brightness, ignoring the material's luminous emittance. A +4 EV panel came out around HDR 16.
+  - Checked against an earlier probe of a glowing screen (material 513: luminous 95.5, +4 EV): the game showed radiance 7.75. Adaptive gives about 16x that; **luminous emittance / 4 pi gives 7.6.**
+  - Emission is now luminous emittance / 4 pi in scene units (`iEmissiveModel=1`, the new default), so it also follows exposure like the game's own glow.
+- May also help beta blocker 11 (tram very bright at night), if that is a glowing material.
+- **To check:** the railing glass (the bright squares should be gone or faint), neon signs in reflections (Neon), and the Jemison tram at night.
+
+## 0.5.121 - 2026-11-25
+
+- **Fixed (likely): a long hard sun shadow on a walkway where nothing stands** (Jemison, tester screenshot; probably also beta blocker 8, the long shadows on the Neon walkways).
+  - The probe: the sun ray was blocked by two **invisible 16 m panels** about 0.4 m above the floor. Instance 180 is a standard material with an emission entry (brightness 192, +6 EV) that isn't drawn as a solid surface: a light-shaft or hologram card. Instance 173 is family 7, the screen/hologram family. The game never draws either as a solid surface there, but both were in our scene as shadow casters.
+- **New instance masks:**
+  - **Glowing cards** (standard material, not drawn as solid, with emission flags): mask 0x10, traced by nothing. They also no longer count as glass for the thin-glass pass or its fallback search.
+  - **Family 7 screens:** mask 0x08, traced only by reflection, GI and thin-glass reflection rays, so they cast no sun or lamp shadows but still show in reflections.
+- **To check:** the same walkway (the shadow should be gone), the Neon walkways, and that screens still show in reflections. Watch for any shadow that should be there going missing (a glowing sign or panel that used to shade the ground).
+- **0.5.121 result: confirmed in game, the walkway shadow is gone.**
+
+## 0.5.120 - 2026-11-25
+
+- **0.5.119: mannequin still missing.** Probes: the RT ray through the mannequin's chest hit the wall behind it (2.20 m), while the mannequin's surface was about 1.2 m away (from the depth buffer). Its skinned parts at 1.19-1.38 m all showed "frozen while others moved 227".
+- **Fixed (likely): mannequins were removed from the RT scene for standing still (beta blocker 7).**
+  - Since 0.5.51 a skinned body near the camera that stays frozen for 60 frames while other characters move is collapsed. That rule is for the player's unused second body, which the game leaves in a T-pose (it cast a second, T-pose shadow).
+  - A mannequin never moves either, so while NPCs walked around, it was collapsed after about a second.
+  - Now a body the game skinned this frame (LOD record bit 30, set only for bodies the game draws) is never collapsed. The player's unused body never has that bit, so it is still removed.
+- **To check:** the mannequin in the red wall's reflection and its shadow. In third person, make sure the T-pose shadow doesn't come back.
+- **0.5.120 result: confirmed in game, the mannequin reflects.**
+
+## 0.5.119 - 2026-11-25
+
+- **Fixed (likely): mannequins and some nearby characters missing from reflections (beta blocker 7).**
+  - Mannequins are posed character models, so they enter the RT scene as skinned characters: one slot per character part (body, head, hair, clothes), nearest first, 64 slots on High and 128 on Ultra.
+  - The GPU lists the candidate parts in arbitrary order and the list held 256. In Neon it was full ("256 candidates within 60 units"), so parts were cut off at random before the nearest-first sort: a mannequin a few metres away could lose to NPCs much further off.
+  - The candidate list now holds 2048, so the sort sees every part in range. The slot counts per quality are unchanged.
+- **To check:** the mannequin from the soak test (and characters close to you in crowded Neon) in reflections. If a mannequin is still missing, probe it with Numpad . and send the log.
+
+## 0.5.118 - 2026-11-25
+
+- **0.5.117: still no screen in the window.** Likely cause (not yet confirmed by a probe): glow learning skips pixels the last-frame image marks as covered by glass or smoke, and a family 7 screen draws its picture as a transparent layer over a black panel. Then every screen pixel is "covered" and nothing is ever learned.
+- **Changed: family 7 screens learn their glow from covered pixels too**, as long as the distance matches the screen (so it's the screen, not something in front of it). In the main reflections and GI. Other objects still never learn from covered pixels.
+- **To check:** look at the AURORA screen for a few seconds, then turn away: does the window keep its colour? If not, one probe of the window (Numpad .) shows the glow value directly.
+- **0.5.118 result:** the window still doesn't reflect the family 7 screen. Video screens are parked for future work (notes in PLAN.md, blocker 5). The glow memory stays in: it works for other glowing surfaces, and GI is back to about 1-3 ms.
+
+## 0.5.117 - 2026-11-25
+
+- **0.5.116: the window still didn't reflect the screen.** Four probes on one family 7 screen: the last-frame image can see it bright (HDR 2.06 / 0.89 / 1.94 pink), but each probe hit a **different instance** (2977, 3111, 3072, 3146) with a different material, same mesh (9049) and place. Each video frame is a separate object record, so a memory keyed by object number started over every frame.
+- **Fixed: family 7 glow is keyed by the screen's world position** (0.5 m cells, hashed into the same memory) instead of its object number, so every frame of one screen's video feeds and reads the same entry. Other families are unchanged.
+- **To check:** look at a video screen for a few seconds, then turn so it's out of view: thin glass, reflections and walls nearby should keep its colour (one averaged colour, not the picture).
+
+## 0.5.116 - 2026-11-25
+
+- **0.5.115 glass probe found it:** the glass reflection ray did hit the screen (instance 3398, family 7) every frame, but the screen's **material changed every frame** (372, 408, 358, 434, ...): family 7 screens play their video as a flipbook of materials.
+  - The glow memory tagged each entry with the object's material word (so a reused slot wouldn't inherit another object's glow). For a flipbook screen the tag never matched: learning restarted every frame and lookups found nothing (glow 0.000).
+- **Fixed: the glow tag leaves out the material number for family 7.** Other families keep the full tag. A used entry is now marked by bit 31 instead of bit 0.
+- This should also fix family 7 screens in the main reflections and GI, not just thin glass.
+- **To check:** look at a video screen for a few seconds, then turn so it's out of view: thin glass, reflections and nearby walls should keep its colour.
+
+## 0.5.115 - 2026-11-25
+
+- **0.5.114 glass probe:** last frame's image was usable for thin glass in all but 0-2 frames per 600. At the window probed, the glass reflection ray hit something every frame but never took its colour from the image. The ring didn't record what the reflection ray hit.
+- **Glass probe ring extended (32 -> 48 bytes per frame):** each frame now also logs the glass reflection ray's hit (instance, family, material), why it did or didn't take the screen colour (off screen last frame, under smoke/glass/metal, distance mismatch, used), and the glow added from the glow memory.
+- **To check:** probe (Numpad .) a window that should reflect the magenta screen again and send the log.
+
+## 0.5.114 - 2026-11-25
+
+- **0.5.113 result:** the magenta screen still doesn't show in thin glass. Next step: a glass probe (Numpad . on the window) to see what the glass reflection rays hit.
+- **Thin glass reflections are dimmer: `fThinGlassStrength` 1.5 -> 1.0** (the tester: too strong). 1.0 is real glass's Fresnel. Alt+Numpad - / + still adjust it live (x0.8 / x1.25) and the new value shows on screen.
+- **To check:** thin glass brightness; if it needs more, note the value Alt+Numpad - gives you.
+
+## 0.5.113 - 2026-11-25
+
+- **0.5.112 result:** the family 12 screen now shows in reflections (seen on the player character), but not in thin glass.
+- **New: thin glass uses the glow memory too.** Glass reflection hits that weren't on screen last frame add the object's learned glow, like the main reflections. The glass pass reads the main reflection pass's memory, only when both run at the same size (otherwise the address would be wrong; then glass works as before).
+- **To check:** the same screen reflected in a storefront window, including when the screen itself is out of view.
+
+## 0.5.112 - 2026-11-25
+
+- **0.5.111 probe:** the non-working screen was **family 12** (material 72). In last frame's image it is bright (HDR 2.9 / 1.0 / 3.4), so the glow memory could learn it.
+  - Why it didn't: our shading draws families we can't read as a grey placeholder, and the glow rule only counted light beyond 8x our shading. A lit grey surface x8 out-shone the screen.
+- **Fixed: glow learning for unknown material families.** For families other than 0 (standard) and 3 (vegetation), the glow is now simply what our placeholder shading misses. Standard and vegetation materials keep the 8x rule (their shading is real, so ordinary lit surfaces don't get a glow).
+- **Scene table dump findings** (RT_FINDINGS): slot +22 (368-byte entries) holds an emission block in the standard layout for family 12 material 72 (luminous 31.8, flags 0x3341). +12 (96 B) and +17 (176 B) hold texture-index-like values. The family 7 table is still unknown: the earlier family 7 screen showed almost black in the image, so it needs its own probe with this build.
+- **To check:** the family 12 screen you probed (bright magenta): look at it, then away; reflections and walls nearby should keep its colour. And if you find a screen that still doesn't, probe it with Numpad .
+
+## 0.5.111 - 2026-11-25
+
+- **0.5.109 result: some video screens kept their light, some didn't.** Probes of one of each:
+  - The working screen is an ordinary material (family 0) with an emission entry, which our shading already lights. The glow memory wasn't needed there.
+  - The failing screen is **family 7**. In the image we learn from it is almost black (HDR 0.016 green, about 40x darker than the working one), so the glow memory has nothing to learn. The video is most likely drawn after the point where we capture last frame's image, or in a way that capture doesn't see.
+  - So family 7 screens need their own texture read at the ray hit, which needs the family 7 material table. It isn't one of the tables we know (+11 standard, +13 vegetation).
+- **New: the crosshair probe (Numpad .) dumps the scene table when it hits an unknown family.** For every CPU-readable buffer in the scene table it logs the stride, size and the hit material's entry. That should show which slot is the family 7 table and where its texture index sits.
+- The glow memory stays (it covers other glowing surfaces our shading gets too dark). 0.5.110's faster learning is included.
+- **To check:** probe a family 7 screen (one that doesn't keep its light) with Numpad . and send the log.
+
+## 0.5.110 - 2026-11-25
+
+- **0.5.109 result:** no errors. GI cost went up from about 3 ms to 3.2-7.5 ms (Neon, High, Frame Generation on, frames 24-34 ms).
+- **Fixed: the glow learning made GI slower.** It picked 1 trace cell in 16 inside every 8x8 block, so every GPU thread group waited for its few learners. Learning now happens in whole 8x8 blocks, 1 block in 16 per frame (rotating): the same amount of learning, but 15 of 16 groups skip it entirely.
+  - The reflection pass's brightness-correction learning (since 0.5.75) used the same pattern and is changed the same way, so reflections may get a little cheaper too.
+- **To check:** GI and reflection times in the log (Neon). And still: do video screens keep their coloured light and reflections after they leave the view?
+
+## 0.5.109 - 2026-11-25
+
+- **New: video screens keep lighting the room and showing in reflections when they are off screen (beta blocker 5).**
+  - Glowing screens in Neon are material family 7, which reads black in the G-buffer, and we haven't decoded that family's material table. Reflection and GI rays that hit a screen took its colour from last frame's image while it was visible, but once it left the view our own shading saw a black surface.
+  - Reflection and GI rays now also learn each object's **glow** while it is on screen: the part of its colour that our shading can't explain even with the largest brightness correction (x8). Off-screen hits add it back. It updates continuously (10% per sample), so it follows a video's average colour over time.
+  - Each entry is tagged with the object's material, so an object slot reused after a load doesn't inherit another object's glow. Objects never seen on screen still have no glow.
+  - Any other glowing surface our shading gets too dark (signs, panels) benefits the same way. Ordinary lit surfaces don't get a glow, because the brightness correction already explains them.
+  - Memory: 8 MB more for reflections and 8 MB more for GI.
+- **To check:** Neon, near big video screens. Look at a screen, then turn so it's off screen: walls, floors and reflections nearby should keep the screen's coloured light. Watch for anything glowing that shouldn't (a wrong object lighting up after a load or after turning around).
+
+## 0.5.108 - 2026-11-25
+
+- **Fixed (likely): NPC hair very shiny (beta blocker 4).**
+  - Skin and hair are G-buffer types 1 and 8. The game takes their roughness from a material table (RT_FINDINGS, "Indirect"), so the G-buffer's roughness and metalness channels don't mean roughness and metalness for them. The RT reflections already left them to the game, but the RT lamp pass read them as normal materials. Hair came out with a mirror-sharp, bright highlight from every lamp, partly tinted like metal.
+  - Skin and hair now get a soft non-metal surface (roughness 0.5, metalness 0) in the RT lamp pass, the Ray Reconstruction guide images, GI and the last-frame capture. We don't read the game's table yet; if 0.5 is too dull or too shiny, that table is the next step.
+- **To check:** NPCs under lamps (Neon, Jemison): hair and skin should no longer shine. Also check faces don't look flat or too matte.
+- **0.5.108 result: confirmed in game, hair is fixed.**
+
+## 0.5.107 - 2026-11-25
+
+- **High reflections now trace 1 ray per pixel (beta blocker 3, "High still too noisy").**
+  - The tester turned effects off one at a time on High: reflections (Numpad 0) were the noise.
+  - High traced 1 reflection ray per 2x2 pixels, moving inside the block every frame: a coarse grain that crawls, which the temporal filter couldn't hide. Ultra had the same noise until 0.5.89 put it back to 1 ray per pixel.
+  - Expected cost: about 2-4 ms more on High in busy places like the Neon walkways. High still differs from Ultra in GI rays (2 vs 4), lamp and sun shadow rays (4 vs 8), reflection length and RT scene range.
+- **To check:** High, the same noisy spot. Is the reflection noise gone, and what is the frame rate (send the log)?
+- **0.5.107 result: confirmed in game, the noise is gone.** Neon walkways on High: reflections 7-9 ms (was 3-5), frame 28-32 ms with Frame Generation on (31-35 fps rendered).
+
+## 0.5.106 - 2026-11-25
+
+- **0.5.105 result:** 7 loads with Frame Generation on, no hang. RR stepped aside for every load and FG switch and came back each time. The fade-in from 0.5.104 was still too noticeable.
+- **Fixed: no sun shadows at all while RT waited after a load.** While RT sun shadows are on, the plugin stops the game drawing its own sun shadow maps. That stayed in force while the RT shadows were paused for the load, so outdoors everything was in full sun for several seconds, then RT shadows snapped on.
+  - Now the game's sun shadows stay until RT has fully faded in. RT sun shadows fade in on top of them, then take over.
+- **New: lamp shadows fade in too.** Before, only reflections, GI and thin glass faded.
+- **Fade is longer: 1.5 s** (was 0.75 s).
+- **New ini settings** (`[RT]`): `fRtSettleSeconds` (default 2, the wait once the scene is ready) and `fRtFadeSeconds` (default 1.5). They let us try other timings without a rebuild. Going below 1 s of wait risks the old after-load GPU hangs.
+- **To check:** loads outdoors in daylight (sun shadows should be there the whole time and change softly), and interiors with lamps. Is the change still noticeable, and which part stands out most?
+- **0.5.106 result:** 5 loads, no hang. The tester called the return of RT after a load "good enough for now".
+
+## 0.5.105 - 2026-11-25
+
+- **Crash on 0.5.104 entering an interior (21:01:28, GPU hang).**
+  - DRED shows only Frame Generation's pacer list and an internal DXGI list unfinished, none of ours. That's the same signature as the 0.5.81 menu hang and the earlier load hangs.
+  - 7 s before, the load started, and the game switched Frame Generation off (21:01:21) and back on (21:01:23). The scene was still loading when it hung, so reflections, GI and glass were paused: the 0.5.103 shorter waits and the 0.5.104 fade weren't active.
+  - Ray Reconstruction was still running through the load. The 0.5.84 bisect showed these hangs need Frame Generation and Ray Reconstruction together.
+- **Fix (likely): no Ray Reconstruction during loads, or for 2 s after Frame Generation switches.** DLSS Super Resolution runs instead. Every RT effect is paused during loads anyway, so RR added nothing then.
+  - The log says `[RR] held back (scene loading)` or `(Frame Generation just switched)` when this happens.
+- **To check:** with Frame Generation on, go in and out of interiors, fast travel and load saves several times. No hang. RT and RR should come back after each load (RR resumes with the RT fade-in).
+
+## 0.5.104 - 2026-11-25
+
+- **0.5.103 result:** five loads, no GPU hang. RT came back 5-12 s after each load started. The tester couldn't see a difference, and asked for RT to come back faster or less noticeably.
+  - The wait after the scene is ready is now 2.4-3.3 s. The rest is the game still streaming in, sometimes in a second wave 0.3 s after the first (another 6 s).
+  - That second wave is exactly where the 0.3.7 GPU hangs happened (records still being rewritten), so it stays paused for now.
+- **New: RT fades in after a load instead of popping on.** Reflections, GI and thin glass blend from the game's own result to RT over about 0.75 s.
+  - RT lamps don't fade: the game's lamps are switched off while they run, and they have the same brightness, so only their shadows appear. Sun shadows also still switch on directly (they come back earlier, when the scene is ready).
+  - The fade is passed to the shaders in spare bits of an existing constant, so nothing else in the passes changes.
+- **To check:** load a save, fast travel, go through doors. The return of RT should be a soft change instead of a pop. Also check that reflections, GI and glass look the same as before once it has faded in (nothing stuck dim).
+
+## 0.5.103 - 2026-11-25
+
+- **0.5.102 duplicate check: no duplicates to remove.** Only 1.5% of the objects are exact copies. 62% on the Neon walkways share their place with a different mesh, but those are the parts of one model split by material (real geometry). In short runs the walkways and Jemison hold 25-31 ms, so the soak test's 61-100 ms looks tied to VRAM filling up over a long session (to be confirmed with a long run later). Details in RT_FINDINGS.md.
+- **RT appears sooner after a load (beta blocker 2).** After a load, RT waits until the scene is calm, then waits more before reflections, GI and lamps return (the 0.3.7 guard against GPU hangs right after a load). Both waits were counted in frames: at 35 fps rendered that was 2.6 s + 5 s.
+  - Now each wait is the shorter of the old frame count and a fixed time: 1 s calm, then 2 s (at least 30 and 45 frames). At 35 fps, RT should come back about 4.5 s sooner. Nothing changes at 90 fps or more.
+  - The same waits also ran mid-walk when Jemison streamed in a lot at once (20:44:54 and 20:45:17 in the last log), so RT dropped out there too. Those gaps get shorter as well.
+  - New log line: **RT effects back after N s**, so we can measure the gap after each load.
+- **To check:** load a save, fast travel and go through a door or two. RT should come back quicker. Most importantly: **no GPU hang or crash after loads** (the waits exist because of those). Send the log.
+
+## 0.5.102 - 2026-11-25
+
+- **0.5.101 breakdown: the Neon walkways' 222k objects are mid-sized pieces at mid range.**
+  - 160-175k are 50-200 m from the camera, and 134k have a bounding radius of 2-10 m (building kit). Only about 3k are alpha-tested and 369 are effect meshes, so neither is the cost.
+  - Jemison is different: 83-98k of its 143-161k objects are more than 1 km away, mostly large (45k over 10 m), and 18k are alpha-tested.
+  - 222k building pieces within 200 m seems like too many, so this build checks whether the game's records hold the same object more than once.
+- **New: duplicate count in the TLAS breakdown line.** It counts objects that are the same mesh at exactly the same place and rotation, and objects that share a place with another one. It uses a 4 MB GPU table cleared each frame (a few microseconds).
+- **To check:** the Neon walkways and Jemison again for 20 s each, then send the log.
+
+## 0.5.101 - 2026-11-25
+
+- **0.5.100 test: the slowdown is smaller but not fixed.** On Ultra the Neon walkways ran at 26-37 ms (27-39 fps rendered, Frame Generation on) instead of the soak test's 61 ms. Jemison ran at 31-37 ms. VRAM stayed at 55-63% of budget, so the VRAM guard never kicked in.
+  - The size cut left out only 3.5k of 269k objects on the walkways (1.4%) and 48k of 272k in Jemison (18%). The walkways' objects are not small far-away clutter, so the cause was guessed wrong.
+  - Going from 63k to 265k objects costs: reflections 3.2 to 5-9 ms, GI 3.0 to 3.7-6 ms, TLAS build 1.6 to 2.4 ms, plus 2-3 ms of sun shadows outside.
+- **New log line: TLAS breakdown** (every 10 s). It counts the objects that stay in the RT scene by distance, by size, and how many are alpha-tested, effect meshes and characters. It shows what the 265k objects actually are before the next fix.
+- **To check:** stand on the Neon walkways and in Jemison for 20 s each (any quality) and send the log.
+
+## 0.5.100 - 2026-11-25
+
+- **Soak test (0.5.99) found a big slowdown.** The beta is on hold; the tester's 12 findings are listed at the top of PLAN.md.
+  - Outside on the Neon walkways, the RT scene jumped from 65k to **275k objects** (Ultra's 4 km range picked up all the far-away city clutter). Frames went from 17 to 61 ms.
+  - In Jemison: 110k objects, VRAM at **97% of budget**, and 90-100 ms frames by the end.
+- **New: objects too small on screen are left out of the RT scene.**
+  - The cut is on an object's bounding radius divided by its distance: about 3 px on Ultra (0.0015), 4 on High, 6 on Medium, 8 on Low (at 3440 wide).
+  - A cup drops out past about 100 m, a crate past about 500 m. Buildings and large props stay in to the full range. Characters and the player are never cut.
+  - The TLAS log line now counts how many objects were left out this way.
+- **New: VRAM guard.** While local VRAM is over 90% of budget, the RT scene range shrinks in steps (down to 40%) and the size cut grows. It grows back once usage drops under 82%. Each step is logged (`VRAM ..% of budget: RT scene range x..`). This mainly cuts our scene size and build time; most of the VRAM in Jemison is the game's own.
+- `[RT] fTlasMinScreenSize`: -1 = from the quality level, 0 = off, or a value.
+- To check in game:
+  - The Neon walkways and Jemison at Ultra. Compare frame rate and VRAM with the soak test.
+  - Do far-away objects visibly lose their shadows or reflections?
+  - Send the log.
+## 0.5.99 - 2026-11-25
+
+- **Fix: the storefront flicker behind thin glass, found with 0.5.98's per-frame crosshair log.**
+  - At the flickering spot the result cycled every 3 frames: reflected, reflected, rejected.
+  - On 2 frames the tagged-glass ray found nothing, so the untagged-window search ran and found the storefront pane 0.37 m away (shop-window family 13, untagged), which reflected.
+  - On every 3rd frame the tagged-glass ray found a tagged layer lying on the floor 18.4 m behind the pane (instance 45655, family 0). It was correctly rejected as "lying on a surface". But a tagged hit used to skip the untagged-window search entirely, so the pane in front lost its reflection for that frame.
+- Now the untagged-window search also runs in front of a tagged hit, up to its distance, and the nearer acceptable object wins. It costs one short extra ray only on pixels where tagged glass was found.
+- 0.5.96 (per-object "stands clear" score) and 0.5.97 (candidate cap 512) weren't the cause but stay. Both remove real ways for the same pass to flip.
+- **Confirmed in game:** the storefront flicker is gone.
+## 0.5.98 - 2026-11-25
+
+- 0.5.97 didn't fix the storefront flicker either, so this is a diagnostic build.
+- **New: the Numpad . probe logs what the thin-glass pass decided at the crosshair on each of the last 64 frames.**
+  - Stage: no glass coverage / rejected / reflected.
+  - Covered, tagged, hit, fallback ran, reflection ray hit, colour from last frame's image.
+  - Object family and instance, distance.
+  - Candidates checked by the first ray and the fallback ray.
+  - Standoff and final weight, and the reflection's brightness.
+  - A flicker shows up as the frame where one of these changes.
+- No change to the image.
+- To check in game: put the crosshair on a spot that flickers, keep still, and press Numpad . (twice is fine). Send the log.
+## 0.5.97 - 2026-11-25
+
+- **Fix (second try): flickering patches behind the Neon storefront glass.**
+  - 0.5.96 didn't fix it. The debug-colour video showed magenta patches ("covered, no pane found") on the far floor and the overhead truss, changing shape every frame. The rest of the pane reflected.
+  - The crosshair probe hit the pane itself (instance 41399, 0.37-0.39 m, shop-window family 13, untagged, score 1.0). So the pane is in the scene; some rays just don't reach it.
+  - Cause: the glass camera ray gave up after 64 see-through candidates. The hardware doesn't hand them over nearest first, so a ray toward the dense smoke and truss layers used up its 64 on far-away layers before reaching the pane 0.4 m in front. Which pixels ran out changed every frame.
+  - The cap is now 512. It still stops a runaway loop (the reason for the cap since 0.3.2).
+- Not the cause, ruled out with the tester: the first-person gun (holstered and third person: no change), the smoke filter, the screen colours, old inputs.
+- 0.5.96's per-object "stands clear" score stays. It removes the same kind of flip at the foot of panes.
+- To check in game: the storefront flicker. In the debug colours (Numpad 4 twice) the far floor and truss behind the pane should stay one colour. Also check GPU time in the `PERF thin glass` line (was 0.4-1.1 ms).
+## 0.5.96 - 2026-11-25
+
+- **Fix: flickering patches seen through thin glass** (Neon storefronts, around the cart and the floor at the foot of the pane).
+  - 0.5.95 test: only Ctrl+Numpad 4 (untagged-window search off) stopped it. Screen colours, old inputs and the smoke filter weren't the cause; the log counted 0-3 bad frames in 600.
+  - Cause: the storefront pane has no glass tag, so the untagged-window search finds it. Since 0.5.64 a hit only counted as a pane where it stood clearly in front of the surface behind it, decided per pixel. That rule filters fake layers lying on floors. Where the floor or the cart sits just behind the pane, pixels were right on the limit, and DLSS's sub-pixel depth jitter flipped them between reflecting and not reflecting every frame.
+  - Now each object gets a "stands clear" score over many frames (sampled 1 pixel in 16 per frame, about 0.2 s to accept, faster to drop), and that score decides for the whole object. A pane in the open is reflected everywhere, including right in front of the cart. A layer lying on a surface still scores low and stays off.
+  - `bThinGlassStandoffScore=0` brings back the per-pixel test.
+- The glass statistics buffer grows by 6 MB (per-object standoff counts and score).
+- To check in game:
+  - At the storefront the patches no longer flicker, and the pane still reflects.
+  - Elsewhere in Neon no new fake reflections appear on floors or the truss in the smoke (the 0.5.64 case).
+## 0.5.95 - 2026-11-25
+
+- **Diagnostics for the flicker seen through thin glass** (Neon storefront). Numpad 4 (thin glass off) stops it; the smoke filter, RT lamps and the quality level don't.
+  - New key **Ctrl+Alt+Numpad 4:** thin-glass reflections stop taking colours from last frame's image and use ray-traced colours only.
+  - The `[G3] camera for thin glass` log line now also counts frames where the reflection pass's inputs were older than this frame, and frames where last frame's image couldn't be used.
+- To check in game, at the flickering window:
+  1. Press Ctrl+Alt+Numpad 4: does the flicker stop?
+  2. Press Ctrl+Numpad 4 (untagged-window search off): does it stop?
+  3. Press Numpad 4 twice to get the debug colours: do patches switch between colours?
+  Then send the log.
+## 0.5.94 - 2026-11-25
+
+- **Gameplay Options has a quality selector again:** Starfield RT > **Ray Tracing Quality**, Low / Medium / High / Ultra (default High), next to **Ray Tracing** On/Off. Both apply live and are saved with the game.
+  - The menu quality sets both the reflection and shadow levels unless the ini has `-1` (custom) for them.
+  - The game's options records can't grey out one option based on another (checked against every options record in the official plugins). So the quality selector stays visible while Ray Tracing is Off. It has no effect then, and ray tracing comes back at that quality when switched On.
+- 0.5.93 test: the tester saw flickering on the floor seen through thin glass in Neon (Medium, DLSS Quality, FG on). Not fixed yet; under investigation.
+- To check in game:
+  - The menu shows two options.
+  - Changing the quality writes a `quality (Gameplay Options)` line in the log.
+  - Ray Tracing Off then On comes back at the chosen quality.
+## 0.5.93 - 2026-11-25
+
+- **Medium GI is back to 1 ray per 2x2 pixels.** In 0.5.92's test the 4x4 GI looked blotchy and crawled slightly, and it saved only about 1 ms (GI 0.5-0.7 ms instead of 1.5-2.3).
+  - 0.5.92 Medium in Neon (DLSS Quality, FG off): 14.5-18 ms (56-69 fps). Reflections 1.5-2.5 ms, RT lamps 1.0-1.7.
+  - Medium keeps its other cuts: no sun shadows inside reflections, 2 lamp shadows, shorter rays and scene range.
+- Low keeps 4x4 GI.
+- Gameplay Options "Ray Tracing On" worked (log: `Gameplay Options: Ray Tracing On`).
+## 0.5.92 - 2026-11-25
+
+- **Gameplay Options is now one setting:** Settings > Gameplay Options > Starfield RT > **Ray Tracing**, On or Off (default On). Off is the same as F8: every RT effect off and the game's own look. On switches them back on. The old RT Reflections and RT Shadows menus (Off to Ultra) are gone. Quality now comes from `iReflectionQuality` / `iShadowQuality` in StarfieldRT.ini (default Ultra). The option has a new id, so older saves start at On.
+- `bStartAllOff` now defaults to 0. With the plugin active, the menu decides once a save is loaded.
+- **Medium is a real step down from High** (it was under 1 ms cheaper):
+  - GI traces 1 ray per 4x4 pixels (was 2x2). New in the shaders: 4x4 trace cells, with the traced pixel moving through the cell in a 16-frame Bayer order.
+  - No sun shadow rays inside reflections.
+  - RT lamps shadow-test their strongest 2 per pixel (was 4).
+  - Reflection rays 1500 (was 2000) and RT scene range 1200 (was 1500).
+- **Low:** GI at 4x4 and 1 lamp shadow.
+- To check in game:
+  - The Gameplay Options menu shows one "Ray Tracing" option and On/Off works live.
+  - Medium (`iReflectionQuality=2` and `iShadowQuality=2` in the ini) is faster than High and its GI doesn't crawl or flicker.
+## 0.5.91 - 2026-11-25
+
+- **Timings in Neon** (3440x1440, DLSS Quality; ms per rendered frame):
+
+  | Preset | FG off | FG on |
+  |---|---|---|
+  | RT effects off | 9-10 ms (~100 fps) | |
+  | Medium | 15-18.5 ms (54-66 fps) | |
+  | High | 16-19 ms (53-63 fps) | 18-21 ms (47-56 rendered, ~95-110 shown) |
+  | Ultra | 19-24 ms (41-53 fps) | 24-27 ms (37-41 rendered, ~75-80 shown) |
+
+- Medium is barely cheaper than High. The difference between the presets needs another look before the beta.
+- The PERF lines said "FG unknown" until Frame Generation was first switched on, because the game doesn't set FG options before then. They now say "FG off" in that case. Logging only.
+## 0.5.90 - 2026-11-24
+
+- **0.5.89 confirmed in game:** the noise looks better. Ultra in Neon (3440x1440, DLSS Quality, **Frame Generation on**): 24-27 ms per rendered frame (37-41 fps rendered, about 75-80 on screen). Reflections 4.7-6.2 ms, GI 3.7-4.5, RT lamps 1.5, TLAS 1.6.
+- The log now records **Frame Generation**. A new line `slDLSSGSetOptions ... Frame Generation ON/OFF` appears whenever the game changes it. Each `PERF RT mode` line now says `FG on/off` and reports "fps rendered" (with FG on, the screen shows about twice that). Before, the log couldn't tell whether FG was on, so the timings were easy to misread.
+- Logging only. Nothing about rendering changes.
+- To check in game: switch FG off and on once in Display settings, then send the log.
+## 0.5.89 - 2026-11-24
+
+- **0.5.88 timings** (Neon, 3440x1440, **DLSS Quality** (renders 2292x960), Ultra, everything on, Frame Generation off): frame 16-22 ms (45-64 fps), down from 66 ms. Reflections 1.2-2.4 ms, GI 1.6-3.0, RT lamps 1.1-1.9, thin glass 0.4-0.9, RR guides 0.6, TLAS 1.6.
+- The tester said the image looked **noisier**. That is the 0.5.88 cuts: reflections dropped to 1 ray per 2x2 pixels and Ultra GI to 2 rays per 2x2 cell.
+- With the time saved, **Ultra** now spends some back on quality:
+  - reflections trace **1 ray per pixel** again (expected about +5 ms);
+  - GI traces **4 rays** per 2x2 cell (was 2; expected about +2.5 ms).
+- **High** GI traces 2 rays per cell (was 1). High reflections stay at 1 ray per 2x2.
+- To check in game: Ultra, DLSS Quality, Neon. Is the noise back to how it was before 0.5.88, and what is the frame rate? Send the log.
+## 0.5.88 - 2026-11-24
+
+- **0.5.87 timings** (Neon, 3440x1440, DLSS in **DLAA** mode, everything on, Frame Generation off, GPU ms per frame):
+
+  | | Ultra | High |
+  |---|---|---|
+  | Frame | 66 ms (15 fps) | 34-41 ms (24-29 fps) |
+  | GI | 23.3 | 2.2-3.0 |
+  | Reflections | 17.7 | 9.3-14.5 |
+  | RT lamps | 4.0 | 2.8-3.5 |
+  | TLAS build | 1.6 | 1.0-1.1 |
+  | Thin glass | 1.3 | 0.9-1.3 |
+  | RR guides | 1.3 | 1.2 |
+
+- **Presets retuned:**
+  - **Reflections trace 1 ray per 2x2 pixels on every level** (Ultra and High traced one per pixel). Ray Reconstruction fills in; Cyberpunk traces reflections at reduced resolution too.
+  - **Ultra GI 1 ray cell per 2x2 pixels** (was per pixel), still 2 rays: about a quarter of its 23 ms.
+  - **0.5.71's long Ultra ranges pulled back:** RT scene range 10 km -> 4 km (High 3 -> 2.5 km), reflection rays 10 -> 5 km, sun rays 10 -> 4 km, characters within 60 m (was 100). The 10 km scene more than doubled the TLAS build for objects you can barely see.
+  - Lamp shadows on Ultra: 8 per pixel (16 was set, but the lamp pass caps at 8).
+- **Big free win: DLSS Quality instead of DLAA.** DLAA renders at full resolution, so every RT pass works on all 5 million pixels. DLSS Quality renders 2293x960, about 44% of the pixels, which roughly halves the cost of every RT pass. Ray Reconstruction is designed for upscaling.
+- **To check in game:** Ultra, everything on, Neon, DLSS Quality (Display settings). One minute, then send the log. Also say whether reflections look noticeably softer or noisier than before.
+
+## 0.5.87 - 2026-11-24
+
+- **0.5.86 result (run D): no hang with Frame Generation + Ray Reconstruction + every effect on**, menus opened about 20 times. RR came back after every menu (12 "running" lines). **The Frame Generation menu hang is fixed.**
+- **But: very low frame rate on Ultra with everything on.** PERF: frame 45.7 ms (22 fps); RT reflections alone 11.5 ms GPU; TLAS build 1.43 ms (0.06 ms with effects off); VRAM 81% of budget. Part of this is 0.5.71's longer Ultra ranges (10 km scene range and rays, characters within 100 m, more lamp shadows).
+- **New: GPU timings for every RT pass.** Every 600 frames the log now prints `PERF GI`, `PERF RT lamps`, `PERF thin glass`, `PERF last-frame image capture` and `PERF RR guide images`, next to the existing `PERF reflections` and the sun-shadow/BLAS/TLAS line. That shows where the frame time goes, for tuning the presets and for the Nexus page (checklist step 5).
+- **To check in game:** Ultra, everything on (F8), FG off, in Neon for about a minute (stand still for part of it). Then switch Gameplay Options to High for a minute. Send the log.
+
+## 0.5.86 - 2026-11-24
+
+- **0.5.85 result (run D):** no crash, but **Ray Reconstruction stopped running after a few menus**, so the run doesn't prove the fix yet. The log shows why: the game takes a **new viewport number for the main view at every menu toggle** (0, 2, 4 ... 100 in one session). 0.5.85's per-viewport table had 8 slots, so from viewport 8 on there was no entry and the game got plain DLSS.
+- The same log confirms the bug 0.5.85 targets. Each toggle switches the old main viewport off ("viewport 0: mode 0, 4294967295x4294967295") a quarter of a second before the new one is set up ("viewport 2: mode 6, 3440x1440"). In that gap the old single global copy held the invalid "off" options.
+- **Fix:** the per-viewport options are now a lookup keyed by viewport number, with no limit. A viewport switched off is dropped.
+- **To check in game (run D again):** FG on, every effect on (F8), Ray Reconstruction on. Open and close menus about 20 times, play a few minutes. The log should keep saying `DLSS Ray Reconstruction is running` after each menu.
+
+## 0.5.85 - 2026-11-24
+
+- **0.5.84 result:** the thin-glass reflections no longer jump while turning (confirmed). The log showed the old camera was from another frame 596 of 600 frames.
+- **Frame Generation test (FG on, menus opened ~20 times):** A, plugin disabled: no hang. B, plugin on with every effect off: no hang. C, every effect on with Ray Reconstruction paused: no hang. So the hang needs **Ray Reconstruction + Frame Generation**.
+- **Fix (likely): GPU hang with Frame Generation on when opening a menu.**
+  - **Cause:** the game sets DLSS options per viewport. Opening a menu sets viewport 2 to DLSS off with an output size of 4294967295 x 4294967295 (the log line right before the 21:19 hang). Our hook kept only the last options it saw, for any viewport, and used them to set up Ray Reconstruction on the main viewport. So the menu's "off, invalid size" options configured RR on the main view. With Frame Generation pacing those frames, the GPU hung.
+  - **Fix:** DLSS options are kept per viewport. RR is set up and run only on a viewport whose own options are valid (DLSS on, a sane output size); others get the game's DLSS untouched. The log says when a viewport is skipped (`[RR] viewport N: DLSS off or invalid there`).
+- **To check in game (run D):** FG on, every effect on (F8), Ray Reconstruction on. Open and close menus about 20 times, play a few minutes. Then send the log.
+
+## 0.5.84 - 2026-11-24
+
+- **0.5.83 result:** "worse". The log shows the fix never engaged: this frame's camera was **not found** in the transparency pass's tables, so the glass used the old camera exactly as before. Any difference was chance.
+- **Second attempt:** the camera now also comes from the copy of PerSceneConstants in the game's global scene table (root table 1, entry 34), where the RT build already reads it, and from the composite pass's own tables after its draw.
+- **Log:** `[G3] camera for thin glass: <source>`, with every constant buffer bound for the composite and the table 1 +34 entry. It's printed 3 times in game and then once a minute. The every-600-frames count of how often the old camera was from another frame stays.
+- **Crash 21:38 (not ours):** the call stack was in `LSCNativeBridge.dll` (Transit Report's snapshot sampler) on the main thread, right after cancelling a load (`LoadPanel_CancelLoad`), reading a null pointer in game code. StarfieldRT.dll appears only in the module list.
+- **To check in game:** turn the mouse at the same glass, then send the log.
+
+## 0.5.83 - 2026-11-24
+
+- **0.5.82 result:** the poster circle and the glass disc are fixed (confirmed).
+- **Fix (likely): thin-glass reflections jumping and sliding against the mouse while turning.**
+  - **Cause:** the thin-glass pass runs right after the game's transparency pass, but it took its camera (position and view matrices) from the main reflection pass. The game records its passes on several threads, so the glass pass was often recorded before that frame's reflection pass and used **last frame's camera** with this frame's depth. While you turn, the reflections were worked out for where you were looking a frame ago, so they lagged and jumped against the turn. The image capture that reflections reuse (0.4.4) had the same stale camera.
+  - **Fix:** the glass pass and the capture take the camera bound by the transparency draws recorded just before them on the same command list, which is always this frame's.
+  - **Log:** `[G3] this frame's camera for thin glass: found` at start, and every 600 frames a count of how often the old camera was from another frame (that's how often it jumped before).
+- **To check in game:** turn the mouse while looking at thin glass (the same spot as the video): the reflection should stay put on the glass, with no jumping. Then send the log.
+
+## 0.5.82 - 2026-11-24
+
+- **Poster circle (RT lamps), second fix.**
+  - **Test results:** it goes away with RT lamps off (Numpad 2), and GI (Numpad 1) makes no difference. Lamp probe at 13 m: both lamps blocked **0.20 m away by the poster itself** (the crosshair object, instance 43334). At 7 m they reach it.
+  - **Cause:** 0.5.80's same-object rule was right, but a lamp shadow ray could step past its own surface only twice. A poster is several layers of one object (cover, frame, backing), so the third hit still cast the shadow.
+  - **Fix:** up to 7 steps past the surface's own layers (8 tries).
+- **Thin glass: a blank disc with no reflection when standing close to a pane.**
+  - **Cause:** the glass pass ignored glass within 0.5 m of the camera, a leftover from before the player was tagged (it kept your own head from counting as glass). A flat pane cut by a 0.5 m sphere around the camera is a circle.
+  - **Fix:** 5 cm. The camera ray skips the player anyway since 0.5.69.
+- **Crash on 0.5.81 (21:19, GPU hang):** DRED shows only DLSS Frame Generation's pacer list and an internal DXGI list unfinished, none of ours. That's the same signature as every earlier hang with Frame Generation on (see 0.2.33). Six seconds before it, the game switched DLSS off on a second viewport (`slDLSSSetOptions viewport 2: mode 0`), most likely a menu or photo-mode transition.
+- **To check in game:** the same poster from far and near with RT lamps on, and a pane of glass up close.
+
+## 0.5.81 - 2026-11-24
+
+- **Thin-glass reflections dimmer:** default `fThinGlassStrength` 3.0 -> 1.5 (1 = the reflectance of real glass).
+- **New keys:** **Alt+Numpad +** / **Alt+Numpad -** make thin-glass reflections brighter or dimmer live (x1.25 / x0.8 per press). The HUD shows the value to put in the ini. The ini line in the plugin folder is replaced on each install, so tell me the value to make it the default.
+- **0.5.80 result (poster circle):** not fixed yet. The test ran with every effect on (F8), and no probe was taken, so it isn't known yet whether lamps, GI or reflections darken it now.
+
+## 0.5.80 - 2026-11-24
+
+- **RT lamps: a poster in the Ryujin lobby still had the circle** (dark from far away, lit up close).
+  - **Lamp probes:** the crosshair object is the poster (instance 43170) in both shots. At 10.2 m (dark) three lamps are blocked **0.13-0.14 m away by that same poster**. At 7.7 m they reach it.
+  - **Why 0.5.78 missed it:** that fix only passes hits that lie flat against the surface. Here the poster's own frame or light-box sides were hit, and they face another way.
+  - **Fix:** as the GI pass does since 0.5.46, a lamp shadow ray now also passes a hit within the self-gap (10 cm + 2% of the view distance) on **the same object** as the lit surface, whatever way it faces. To find that object, a camera ray is traced only when a shadow ray is blocked inside the gap, so the extra cost is small. The lamp probe uses the same test.
+- **To check in game:** the same poster from far and near with RT lamps on: lit at every distance.
+
+## 0.5.79 - 2026-11-24
+
+- **0.5.78 result:** the RT lamp circle in the Ryujin lobby is gone (confirmed).
+- **New: soft lamp shadows** (`fRTLampSoftness=0.25`, metres).
+  - **Before:** every lamp shadow ray aimed at the lamp's exact centre, a point light, so lamp shadows had razor-sharp edges.
+  - **Now:** each shadow ray aims at a random point on a disc of that radius around the lamp, different every frame and per lamp. Ray Reconstruction blends them into soft edges that are sharp where an object touches the surface and widen with distance, like real lamps.
+  - 0 = hard shadows as before. Bigger = softer (0.1 for small bulbs, 0.5 for large panels). Read at start-up.
+  - **Needs Ray Reconstruction on** (Ctrl+Numpad 0). With plain DLSS the edges look grainy instead of soft.
+- **To check in game:** shadows of people, counters and chairs under the lobby lights: soft edges and no crawling grain. Compare with `fRTLampSoftness=0` if needed.
+
+## 0.5.78 - 2026-11-24
+
+- **RT lamps: the same circle as the reflections (Ryujin lobby video).** The red walls went dark beyond a circle around the camera.
+  - **Lamp probes:** wall 14.8 m away (dark): two lamps blocked **0.14-0.16 m** from the wall point. Wall 9.3 m away (lit): the same kind of lamp reaches it.
+  - **Cause:** the level-of-detail mismatch again. Past a distance the game draws a simpler wall, and our full-detail copy sits a little in front of it, so the lamp's shadow ray hit the copy's front face right away. Lamp shadows skipped such hits only from behind (0.5.45) or within 10 cm.
+  - **Fix:** as for reflections in 0.5.76, lamp shadow rays now also skip a front-face hit within the self-gap (10 cm + 2% of the view distance) that lies parallel to the lit surface. Real blockers face another way and still cast shadows. The lamp probe (Numpad .) uses the same test.
+- **To check in game:** the same walk in the Ryujin lobby with RT lamps on: the walls should stay lit at every distance, with no circle.
+
+## 0.5.77 - 2026-11-24
+
+- **0.5.76 result:** the reflection circle in the Ryujin lobby is gone (confirmed).
+- **New: F8 switches every RT effect off and back on** (`iMasterToggleKey=119`).
+  - **Off:** remembers what was on, then applies the baseline: RT reflections, GI, RT lamps, RT sun shadows, thin glass and the glass tweaks off, and Ray Reconstruction paused (plain DLSS). That's the game's own look.
+  - **On:** restores exactly what was on before. If nothing was on when you pressed it, F8 turns everything on.
+  - While off, it stays off through Gameplay Options changes and save loads.
+  - Individual keys still work as before.
+- **To check in game:** F8 back and forth in a few places (Neon, the Ryujin lobby, outdoors). Each press should switch the whole look at once, with a HUD message.
+
+## 0.5.76 - 2026-11-24
+
+- **0.5.75 result:** still a circle. The reflection-ray probe found the real cause:
+  - wall spot 3.8 m away: the reflection ray hits the room behind, 14 m away, bright (HDR 9.9, 6.3, 4.7);
+  - wall spot 12 m away: the reflection ray hits **the wall itself, 0.01 m from its start** (the same object), so it took the wall's own red colour and showed no reflection.
+- **Cause: the level-of-detail mismatch, as with the earlier rings.** Past a distance the game draws a simpler wall model, while our RT copy is the full one. The reflection ray starts on the game's surface and runs straight into our copy. Since 0.5.33 reflections skipped such hits only when they hit the copy from behind; here they hit its front.
+- **Fix:** reflection rays also skip a front-face hit within the self-gap (10 cm + 2% of the view distance) when it lies parallel to the surface they left (its own copy). Objects standing on the surface face another way and still reflect. Up to 3 such skips per ray.
+- **Source view fix:** "hit right at its start" (magenta) is now checked before "colour from the screen" (green). A self-hit lands on its own on-screen pixel, so in 0.5.73 it showed green and hid this.
+- 0.5.75's per-object colour matching stays (Alt+Numpad 5).
+- **To check in game (Ryujin lobby):** walk toward the back wall and away. The reflections should cover the whole wall at every distance. With Alt+Numpad 0 there should be no magenta on the walls.
+
+## 0.5.75 - 2026-11-24
+
+- **Fix (likely): reflections growing in a circle as you move (Ryujin lobby).**
+  - **Not the level-of-detail problem** behind the earlier rings: the source view (0.5.73) showed no magenta or yellow (no hits on our own copy, no distance mismatches). Outside the circle, every ray reached the room behind you, but it was coloured by **our shading**, which is duller than the game's lit image used inside the circle. The circle is the border between the two.
+  - **Change:** where a reflected point is on screen, the reflection pass also shades it our way (1 pixel in 16 per frame) and learns, per object, the ratio between the game's colour and ours. Where an object is off screen, our shading is multiplied by its learned ratio. Both sides now match, so the bright reflections no longer stop at a moving edge. Objects never seen on screen keep plain RT shading.
+  - Smoke-covered pixels don't teach (their colour is the smoke's).
+  - `bReflectionMatchScreen=1`; **Alt+Numpad 5** toggles it to compare.
+- 0.5.74's reflection-ray probe (Numpad .) is included.
+- **To check in game (Ryujin lobby, source view off):** walk toward the back wall and away. The reflections should stay bright at every distance, with no moving edge. Compare with Alt+Numpad 5 off. Objects need a second on screen to learn.
+
+## 0.5.74 - 2026-11-24
+
+- **0.5.73 result:** outside the arch, the source view is solid **red**: the reflected point was off screen last frame. A wall you face reflects what's behind you, so from far away its rays hit ceiling behind you, which has no on-screen colour to take. Walking closer, the upper wall reflects ceiling that's on screen. So the circle is where reflections switch from the game's image to our own shading, and our shading is too dull there.
+- **Probes on the ceiling:** a bright light panel is a standard material with its glow filled in: screen radiance 154, glow level +3.5 EV, warm tint (1.0, 0.82, 0.62), glow texture = its albedo. Our shading gives it about 70% of the screen value with the right tint. So the panels aren't the whole story.
+- **New probe:** Numpad . now also follows the **reflection ray from the crosshair** (`[R] reflection ray at the crosshair`). It logs what the ray hits (object, distance, material), whether its colour came from the screen or our shading and why, and both values side by side: the colour used, our own shading of the same hit, and the game's probe value. On a green pixel that's a direct measurement of how far off our shading is.
+- **To check in game (Ryujin lobby, source view off):**
+  1. Crosshair on the back wall from close up (where it reflected well), Numpad .
+  2. Back away until the same spot loses its reflection, Numpad . again.
+  3. Send the log.
+
+## 0.5.73 - 2026-11-24
+
+- **0.5.72 result (source view video, Ryujin lobby):** on the back wall the boundary between green (colour from the screen) and red (ray traced by us) is an arch centred on the player. Inside it, closer, reflections come from the screen; outside it, farther, they're ray traced, and the arch moves as you walk. That's the "growing circle".
+- **Likely cause, the same family as the earlier rings** (copper columns 0.5.33, the RT lamp ring 0.5.44-45, the GI ceiling ring 0.5.46-47, the sun-shadow building flips 0.5.58-60): past a set distance the game draws a simpler model of each object (its level of detail), while our RT copy is always the full model.
+- **The source view now says why a reflection is ray traced:**
+  - **red:** the hit point was off screen last frame;
+  - **yellow:** on screen, but the distance there didn't match (another surface in front, or the full model vs the game's simpler distant one);
+  - **white:** on screen, but marked unusable there (smoke, glass, metal);
+  - **magenta:** the ray hit something within 50 cm + 3% of the view distance of where it started (likely the wall's own full-detail copy);
+  - **green** (from the screen) and **blue** (no hit) as before.
+- **To check in game:** the same walk in the Ryujin lobby with Alt+Numpad 0 on, as a video or two screenshots (near and far). The colour outside the arch says which fix it needs.
+
+## 0.5.72 - 2026-11-24
+
+- **0.5.71 result (Ryujin lobby video):** on the same red back wall, reflections cover more of the wall as you walk in and shrink as you back away, with an edge that moves with you ("grows in a circle"). Reflection strength (Ctrl+Numpad *) doesn't change that. Probes on one wall panel at 13 m and 10 m: RT applied both times, roughness 0.06-0.11, head-on view, weight 0.020. So it isn't a range limit, roughness or viewing angle.
+- **Likely cause:** a reflected point that was on screen last frame takes its colour from last frame's image, which shows the ceiling light panels bright, as the game draws them. A point that wasn't on screen is shaded by our own lighting, which gets those panels' glow wrong, so they come out dull. From far back, the wall reflects ceiling behind you (off screen); walking in, it reflects ceiling that's on screen, so the bright area spreads.
+- **New debug view, Alt+Numpad 0 (reflection source view):** colours every reflection by where its colour came from. **Green** = last frame's image (on screen), **red** = ray traced and shaded by us (off screen), **blue** = no hit (the game's probe). Shown at full strength, so it's visible on any surface. Press again to turn it off.
+- **To check in game (Ryujin lobby):**
+  1. Alt+Numpad 0, then walk toward and away from the wall: does the edge of the bright reflections follow the green/red border?
+  2. Turn it off, put the crosshair on one of the ceiling light panels, press Numpad . once, then send the log (it shows that panel's material, to fix its glow in our shading).
+
+## 0.5.71 - 2026-11-24
+
+- **Requests after 0.5.70:** stronger glass blur, smoke visible in reflections, and longer ranges on Ultra so nothing pops in.
+- **Found in the log:** the ini says Ultra, but the save's **Gameplay Options set Starfield RT to High** after loading (the menu overrides the ini). The last tests ran on High: 64 characters within 40 m, 3 km reflection rays, 4 lamp shadows, GI with a quarter of the rays. Set **Settings > Gameplay > Starfield RT** to Ultra (both options).
+- **Glass blur:** default `fThinGlassBlurPx` 4 -> 8.
+- **Smoke in reflections** (`bSmokeInReflections=1`, Alt+Numpad 7 toggles):
+  - **Why it was missing:** reflections take the colour of on-screen points from last frame's image, but every pixel covered by smoke or glass was marked unusable there (since 0.3.9, against GI flicker). Those points were ray traced instead, and ray tracing doesn't see smoke.
+  - **Change:** smoke-covered pixels keep their distance in that image, in a form GI still rejects. Reflections (floors and thin glass) now use them, so a reflected point that was on screen behind smoke takes its smoky colour. Points that weren't on screen are still ray traced without smoke. GI is unchanged.
+  - Metal pixels stay unusable (0.5.29, mirror tunnels).
+- **Ultra ranges extended:**
+  - **RT scene range:** objects farther than 1.5 km were left out of the RT scene on every level, so distant buildings popped into reflections and shadows. Now 10 km on Ultra (3 km High, 1.5 km Medium, 1 km Low).
+  - **Reflection rays** 6 km -> 10 km; **sun shadow rays** 3 km -> 10 km.
+  - **Characters** within 100 m (was 60). The cap stays at 128 skinned pieces (about 25 characters), nearest first.
+  - **Lamp shadows:** the 16 strongest lamps per pixel get a shadow (was 8), so fewer lamps switch their shadow on and off as you move.
+  - The log's quality line now also prints the RT scene range.
+- **Cost:** more GPU time on Ultra (bigger scene, more lamp shadow rays). Check the `PERF` lines if it gets slow.
+- **Not ours:** lamps themselves can still pop in at the game's own light fade distance. RT only lights the lamps the game hands over.
+- **To check in game:** set Ultra in Gameplay Options first. Then the Neon smoke reflected in floors and windows (compare with Alt+Numpad 7), the glass blur, and distant buildings in reflections and shadows.
+
+## 0.5.70 - 2026-11-24
+
+- **0.5.69 result:** the gun and arms are gone from reflections (confirmed). Next request: thin-glass reflections need some blur and the right colours; people in them look undetailed.
+- **Why they looked wrong:** the thin-glass pass shaded everything it reflected with our own simple lighting (texture colour, sun, the game's lamps and a flat ambient). It never used the game's own image, as the main reflections have since 0.4.4. People came out flat and plain, and rays that hit nothing got a bluish "sky" colour, which tinted windows indoors.
+- **Changes:**
+  - **Real colours from the screen:** a reflected point that was visible on screen last frame now takes its colour from last frame's image, so people, signs and lit walls look as the game draws them, with full detail. Points that weren't on screen, or that were behind smoke, glass or metal, are ray traced as before.
+  - **Blur:** a new pass softens the reflection across each pane (`fThinGlassBlurPx=4.0`, radius in pixels at 1440p; 0 = mirror sharp). It only mixes glass pixels at a similar distance, so it never smears across a pane's edge.
+  - **Misses:** a softer, less blue colour.
+- **Known limit:** in thick smoke (Neon), most of the screen is marked unusable in last frame's image, so reflections there are still mostly ray traced.
+- **To check in game:** shop windows with people behind you (in view and out of view), windows in a brightly lit area, and the blur. If the blur is too strong or too weak, change `fThinGlassBlurPx` (it's read at start-up).
+
+## 0.5.69 - 2026-11-24
+
+- **0.5.68 result:** arms and gun still show in window reflections.
+- **Real cause:** the thin-glass pass first traces a ray from the camera to find the window. That ray treated everything as solid, so the player tag (0.5.65, 0.5.68) had no effect on it. Parts of the first-person gun (lens, sights) and arms gear count as glass. Our copy of them sits at their real world position, not where the game draws the first-person view, which uses its own field of view. The camera ray found "glass" on that copy and painted a reflection there: a pale, arms-and-gun-shaped copy next to the real ones. It went away with Numpad 4 because that's the pass that drew it. It was never a reflection of the gun in the window.
+- **Fix:** the glass pass's camera ray (and its untagged-window search) now skips the player's body, as reflection, GI and shadow rays already do.
+- The 0.5.68 weapon tagging stays: it keeps the gun out of floor reflections and shadows.
+- **To check in game:** the same window in first person: no pale arms or gun copy. Real windows still reflect.
+
+## 0.5.68 - 2026-11-24
+
+- **0.5.67 result:** the ghost gun in the window goes away with thin glass off (Numpad 4), and Numpad 9 doesn't change it. So it's our RT reflection, not the game's glass effect. The near-camera probe shows the weapon is about 50 separate parts (records 63136-63185 in Neon), listed right next to your own body's parts (63159-63165). Most were already tagged as the player. A few weren't: their size bound reads 2 m or 10 m (it's a loose upper bound, not the real size), and 0.5.65 only tagged objects under 1.5 m.
+- **Fix:** a rigid object within 1.5 m of the camera now counts as the player if one of your body's skinned parts is within 64 places of it in the game's list (and stands where the player does). There's no size limit any more. Walls and props are thousands of places away in that list, so they aren't caught. In third person the camera is metres behind your character, so your weapon still reflects and casts shadows.
+- **To check in game:** the same window in first person: no ghost gun. Third person and photo mode: your character and gun still reflect.
+
+## 0.5.67 - 2026-11-24
+
+- **0.5.66 result:** 295 objects within 3 m of the camera. The first 48 listed were all wall and building pieces (the nearest 1.18 m away), nothing gun-sized and nothing tagged as the player. So the gun was either cut off the list, or it isn't in the RT scene at all.
+- **Probe narrowed to 1.5 m,** so the list can't fill up with walls. If it lists nothing small near the camera, the gun isn't in our scene, and the ghost in the window is the game's own see-through-glass effect (it draws what's behind glass from a copy of the screen that includes your gun), not an RT reflection.
+- **To check in game,** in front of the window with the ghost gun:
+  1. Numpad 4 (thin-glass reflections) off and on: does the ghost go away?
+  2. Numpad 9 (view through glass sharp/blurred): does the ghost change or go away?
+  3. Numpad . once, then send the log.
+
+## 0.5.66 - 2026-11-24
+
+- **0.5.65 result:** the first-person gun still shows in reflections (a pale, see-through copy in a Neon window). The arms are gone from that screenshot.
+- **New probe:** Numpad . now also lists every object within 3 m of the camera (`[near]` lines): record and mesh, bones, whether it's in the RT scene, opaque or not, whether it's tagged as the player, whether the game skinned it this frame, its size, distance, offset from the camera and rotation. This shows exactly how the gun is stored, instead of guessing a third rule. No behaviour change otherwise.
+- **To check in game:** first person, gun out, standing still in front of the same window. Press Numpad . once, then send the log.
+
+## 0.5.65 - 2026-11-24
+
+- **0.5.64 result: the Neon smoke flicker on thin glass is gone** (confirmed in game). The thin-glass issue parked since 0.3.10 is closed.
+- **Fix: your first-person arms and gun no longer show in reflections.**
+  - **Cause:** the RT scene recognised the player's body (to leave it out of reflections, GI, glass and shadows) only as a skinned character standing right under the camera. The first-person arms are a separate, tilted rig anchored elsewhere, so that test missed them. The weapon isn't skinned at all, so it was never recognised.
+  - **Change:** two more things now count as the player:
+    - a tilted character rig that the game draws, within 2.5 m of the camera (in first person, that's the arms; NPCs always stand upright);
+    - a small rigid object (under 1.5 m half-size) whose centre is within 1.5 m of the camera (the held weapon).
+  - Like the rest of the first-person body, they're skipped by reflection, GI and glass rays and cast no sun or lamp shadow.
+  - In third person the camera is metres behind your character, so your character and weapon still show in reflections and cast shadows.
+  - **Possible side effect:** a small prop within 1.5 m of the camera (on a shelf you're pressed against) drops out of reflections and shadows while you're that close.
+- **To check in game:** first person over a reflective floor or window: no arms or gun in the reflection. Third person: your character and weapon still reflect and cast shadows. Photo mode too.
+
+## 0.5.64 - 2026-11-24
+
+- **0.5.63 result:** still flickering, and the smoke filter (Alt+Numpad 4) made no difference. The debug-view video shows why. Dense smoke covers almost every pixel (magenta), so every object scores as "drawn see-through" and the filter can't tell anything apart. The flicker is **yellow patches popping on and off from frame to frame**, on the overhead truss and on the floor far down the walkway. They're see-through layers (trim, decals and the like) that lie **on** solid surfaces. Our RT copy sits a few centimetres off the drawn surface, so with the game's jittered depth they landed just in front of the cut-off in some frames and not in others.
+- **Fix:** a glass hit must now stand clearly off the surface behind it: at least 15 cm + 3% of the distance in front of it, and 20 cm off its plane. The untagged-window search has had this test since 0.3.10; tagged glass never had it. Real windows (shop fronts, canopies) stand well off what's behind them.
+- The smoke filter stays in. It still removes things only smoke covers where the smoke is thin.
+- **Trade-off:** glass mounted flat against a wall (a glass cover on a poster) gets no RT reflection.
+- **To check in game (Neon walkway, Numpad 0 on, Numpad 4 on):** the flicker should be gone. In the Numpad 4 debug view, no yellow or white patches should pop on and off on the truss or the floor. Shop windows should still be yellow or white.
+
+## 0.5.63 - 2026-11-24
+
+- **0.5.62 result:** the pass ran this time. Numpad . (the probe) in the middle of the Neon smoke hit **the smoke plume itself**: instance 18536, LOD dword 0x3a307, **material family 7** (the family of effects and glowing panels), not tagged as glass, found by the untagged-window search 3.5 m away. Its glass score was 0.59, then 0.37: the plume covers itself with its own see-through layer, so it scored just around the 0.5 threshold and still got a partial reflection that faded in and out.
+- **Fix:**
+  - The untagged-window search now skips family 7. The smoke plume is one, and glowing panels are solid surfaces that already get the main reflection. Real shop windows are another family (13).
+  - The score threshold is stricter: no reflection below 0.7, full from 0.9 (was 0.5 / 0.85). Smoke scored up to 0.6, and real panes score close to 1.
+- **To check in game (Neon walkway, Numpad 0 on, Numpad 4 on):** the smoke should show no reflection and the floor under it should be steady. Numpad 4's debug view over the smoke should be magenta or blue, not yellow, white or green. Shop windows should still reflect.
+
+## 0.5.62 - 2026-11-24
+
+- **0.5.61 result: "no difference".** The log shows why. The thin-glass pass ran for only about 2 seconds of the test, because it needs RT reflections (Numpad 0). The baseline had them off, and Numpad 0 was cycled on, through the debug views, and back off. For the rest of the test, the log said `thin-glass reflections: skipped: RT reflections off`. The HUD still said "on", so neither the fix nor the old flicker was showing.
+- **Change:** Numpad 4 now says "on, but NOT RUNNING: turn RT reflections on (Numpad 0)" when reflections are off.
+- **The same log ended in a GPU reset** (device removed, reason "reset", no page fault, no breadcrumbs), about 30 s after the last key press, with reflections, GI, lamps and thin glass all off. If the game didn't crash for you there (for example you quit), it was most likely the shutdown. If it did crash, say so.
+- **To check in game (Neon walkway):** Numpad 0 until the HUD says reflections are on (RT), then Numpad 4 to "on". Compare Alt+Numpad 4 (smoke filter) on and off. Then use the Numpad 4 debug colours on the smoke.
+
+## 0.5.61 - 2026-11-24
+
+- **Fix (likely): thin-glass reflections flickering with the smoke in Neon** (the issue parked since 0.3.10).
+  - **Cause:** the thin-glass pass decided per pixel, from the game's transparency coverage, whether glass was there and how strongly to reflect. Smoke adds to that coverage and changes every frame. So:
+    - objects tagged as see-through that the game doesn't actually draw as glass (light beams, glow cards and similar effect meshes) got a mirror reflection wherever smoke drifted over them, and lost it when the smoke moved on;
+    - real panes with a faint coverage of their own got a strength that rose and fell with the smoke density (the 0.4.10 fade made this worse, not better).
+  - **Change, a smoke filter:** each object now earns a **glass score**: the share of its pixels where the game draws something see-through. It is sampled on a rotating 1-in-16 pixel pattern whether or not anything is drawn there, and averaged over time (rises in about half a second, drops faster). A real pane is always covered, so it scores about 1 and reflects at a steady strength, however much smoke is around. A mesh that only smoke drifts over scores low and gets no reflection. The reflection no longer fades with the coverage of each pixel.
+  - Panes fade in over about half a second the first time they're seen after a load.
+  - **The untagged-window search is on again by default** (`bThinGlassUntaggedFallback=1`). It was turned off in 0.5.13 because it flickered under smoke; the score now filters it too, so Neon's shop windows whose material isn't tagged as glass reflect again. Ctrl+Numpad 4 still toggles it.
+  - **New key:** Alt+Numpad 4 switches the smoke filter on and off live (`bThinGlassSmokeFilter=1`), for comparison.
+  - **Debug view** (Numpad 4 to "debug colours"): new **orange** = an object that only smoke covers, filtered out. **Green** = a reflecting object still fading in. Yellow and white are reflected glass, as before.
+  - **F8** now logs the glass score of the object at the crosshair (`[G3] F8 glass score`).
+- **To check in game, in the Neon walkway with the smoke:**
+  1. Thin glass on (Numpad 4): the floor and walls under the smoke should be steady.
+  2. Alt+Numpad 4 (filter off) should bring the flicker back. That shows the filter is what fixed it.
+  3. Shop windows, including the ones that needed the untagged search, should still reflect after half a second.
+  4. If something still flickers: Numpad 4 to the debug view on that spot, F8 with the crosshair on it, and send the log and a screenshot.
 
 ## 0.5.60 - 2026-11-23
 

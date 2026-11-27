@@ -48,6 +48,29 @@ namespace rt
     // around it, and where each command list stopped. Returns true once the device is gone.
     void EnableDred(bool on);
 
+    // 0.5.123: labels our own GPU work in DRED's breadcrumbs (a marker before each of our dispatches and builds), so a
+    // GPU hang report names the plugin pass the GPU stopped in. Our passes record into the game's command lists, which
+    // have no names, so without these a hang inside one of them only showed "dispatch".
+    bool DredMarksOn();
+
+    // 0.5.130: the game's reflection-probe cube array, blanked everywhere. While on, any SRV of `probeArray` written or
+    // copied into a shader-visible heap slot is immediately replaced by a view of `black` (a zeroed cube array of the same
+    // format and slice count), so no pass, hooked or not, applies the game's cubemap reflections. RT reflections replace
+    // them. Off restores normal views from the next copy on (the game re-copies its descriptors every frame).
+    void SetCubemapBlanking(ID3D12Resource* probeArray, ID3D12Resource* black, DXGI_FORMAT format, UINT slices);
+    void EnableCubemapBlanking(bool on);
+    std::uint64_t CubemapBlankCount();
+    // 0.5.131: no blanking for copies made on this thread while on (GatherIndirect: its ambient light needs the probes).
+    void SuppressCubemapBlankingOnThisThread(bool on);
+    template <class L>
+    inline void DredMark(L&& list, const wchar_t* what)
+    {
+        if (!DredMarksOn()) return;
+        UINT n = 0;
+        while (what[n]) ++n;
+        list->SetMarker(0, what, (n + 1) * sizeof(wchar_t));
+    }
+
     // 0.2.13: the upload-heap buffer containing a GPU address (offset within it), or nullptr. Only meaningful for an
     // address that is in use right now (e.g. a CBV just bound): the newest registered resource at an address wins.
     ID3D12Resource* FindUploadBuffer(D3D12_GPU_VIRTUAL_ADDRESS va, std::uint64_t& offset);
@@ -60,6 +83,7 @@ namespace rt
     bool CheckDeviceRemoved(ID3D12Device* device);
     // 0.2.33: logs local video memory use against the OS budget (and the peak so far). `when` labels the line.
     void LogVram(ID3D12Device* device, const char* when);
+    float VramUsedFraction(ID3D12Device* device);  // 0.5.100: local VRAM used / budget (0 if unknown)
 
     // Look up the buffer view at (shader-visible GPU table base + offset descriptors).
     bool LookupGpuTable(D3D12_GPU_DESCRIPTOR_HANDLE tableBase, std::uint32_t offset, BufferView& out);
